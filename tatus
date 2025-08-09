@@ -1,0 +1,9 @@
+core.editor="C:\Users\9shao\AppData\Local\Programs\Microsoft VS Code\bin\code" --wait
+user.name=吕一轩
+user.email=2939105673@qq.com
+credential.https://gitee.com.provider=generic
+http.postbuffer=524288000
+http.lowspeedlimit=0
+http.lowspeedtime=999999
+http.sslverify=false
+url.https://github.com:443/.insteadof=https://github.com/
