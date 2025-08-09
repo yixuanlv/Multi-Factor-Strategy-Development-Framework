@@ -83,6 +83,14 @@ def main(factor_name):
     print("=" * 60)
     
     try:
+        # 创建测试结果主文件夹
+        test_results_dir = os.path.join(work_dir, "../测试结果")
+        os.makedirs(test_results_dir, exist_ok=True)
+        
+        # 为当前因子创建独立的子文件夹
+        factor_results_dir = os.path.join(test_results_dir, factor_name)
+        os.makedirs(factor_results_dir, exist_ok=True)
+        
         # 加载数据
         data, factor_data = load_data(factor_name)
         
@@ -103,7 +111,7 @@ def main(factor_name):
         print("\n开始单因子分析...")
         
         # 准备图片保存路径
-        image_save_path = f"../测试结果/{factor_name}_full_analysis.png"
+        image_save_path = os.path.join(factor_results_dir, f"{factor_name}_full_analysis.png")
         
         results = analyze_single_factor(
             factor_data=factor_data_ready,
@@ -117,31 +125,30 @@ def main(factor_name):
         
         print("\n分析完成！")
         
-        # 保存结果
-        output_dir = f"../测试结果/{factor_name}_results"
-        os.makedirs(output_dir, exist_ok=True)
+        # 保存结果到因子专用文件夹
+        output_dir = factor_results_dir
         
         # 保存IC统计
         ic_stats = results['ic_stats']
         ic_df = pd.DataFrame([ic_stats])
-        ic_df.to_csv(f"{output_dir}/{factor_name}_ic_stats.csv", index=False)
+        ic_df.to_csv(os.path.join(output_dir, f"{factor_name}_ic_stats.csv"), index=False)
         
         # 保存多空组合统计
         ls_stats = results['long_short_stats']
         ls_df = pd.DataFrame([ls_stats])
-        ls_df.to_csv(f"{output_dir}/{factor_name}_long_short_stats.csv", index=False)
+        ls_df.to_csv(os.path.join(output_dir, f"{factor_name}_long_short_stats.csv"), index=False)
         
         # 保存分组收益率
         group_returns = results['group_returns']['group_returns']
-        group_returns.to_csv(f"{output_dir}/{factor_name}_group_returns.csv")
+        group_returns.to_csv(os.path.join(output_dir, f"{factor_name}_group_returns.csv"))
         
         # 保存累计收益率
         cumulative_returns = results['cumulative_returns']
-        cumulative_returns.to_csv(f"{output_dir}/{factor_name}_cumulative_returns.csv")
+        cumulative_returns.to_csv(os.path.join(output_dir, f"{factor_name}_cumulative_returns.csv"))
         
         # 保存多空收益率
         ls_returns = results['long_short_returns']['long_short_returns']
-        ls_returns.to_csv(f"{output_dir}/{factor_name}_long_short_returns.csv")
+        ls_returns.to_csv(os.path.join(output_dir, f"{factor_name}_long_short_returns.csv"))
         
         print(f"\n结果已保存到: {output_dir}")
         
@@ -151,4 +158,4 @@ def main(factor_name):
         traceback.print_exc()
 
 if __name__ == "__main__":
-    main( factor_name='multivariate_rolling_120_复合因子')
+    main( factor_name='str')

@@ -10,6 +10,7 @@
 *.html
 *.xlsx
 *.xls
+*.csv
 *.ipynb
 *test*
 *Test*
