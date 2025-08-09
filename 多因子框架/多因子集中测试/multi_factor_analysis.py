@@ -61,10 +61,12 @@ class MultiFactorAnalyzer:
         common_stocks = None
         
         for factor_name, factor_data in self.factors_data.items():
-            # 合并因子数据和收益率数据
+            # 合并因子数据和收益率数据，包含所有需要的列
             merged_data = pd.merge(
                 factor_data[['date', 'order_book_id', 'factor_value']],
-                returns_data[['date', 'order_book_id', 'return']],
+                returns_data[['date', 'order_book_id', 'return', 'close'] + 
+                            [col for col in ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended'] 
+                             if col in returns_data.columns]],
                 on=['date', 'order_book_id'],
                 how='inner'
             )
@@ -91,6 +93,38 @@ class MultiFactorAnalyzer:
             
         print(f"数据对齐完成：{len(common_dates)}个日期，{len(common_stocks)}只股票")
         print(f"有效因子数量：{len(self.aligned_factors)}")
+
+    def _filter_tradable_stocks(self, data, for_buy=True):
+        """
+        过滤可交易的股票
+        for_buy: True表示买入过滤，False表示卖出过滤
+        """
+        filtered_data = data.copy()
+        
+        # 检查是否存在相关列
+        available_cols = [col for col in ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended'] 
+                         if col in filtered_data.columns]
+        
+        if not available_cols:
+            return filtered_data
+        
+        # 买入过滤：不能买入涨停、ST、停牌、跌停的股票
+        if for_buy:
+            for col in available_cols:
+                if col in filtered_data.columns:
+                    # True表示在该状态，需要过滤掉
+                    mask = ~filtered_data[col].astype(bool)
+                    filtered_data = filtered_data[mask]
+        
+        # 卖出过滤：不能卖出跌停、停牌的股票
+        else:
+            for col in ['limit_down_flag', 'suspended']:
+                if col in filtered_data.columns:
+                    # True表示在该状态，需要过滤掉
+                    mask = ~filtered_data[col].astype(bool)
+                    filtered_data = filtered_data[mask]
+        
+        return filtered_data
         
     def calculate_factor_ic(self, factor_name: str, method: str = 'spearman') -> pd.Series:
         """计算单个因子的IC序列"""
@@ -104,9 +138,15 @@ class MultiFactorAnalyzer:
         def calculate_ic_for_date(group):
             if len(group) < 10:
                 return np.nan
+            
+            # 应用买入过滤
+            filtered_group = self._filter_tradable_stocks(group, for_buy=True)
+            
+            if len(filtered_group) < 10:
+                return np.nan
                 
-            x = group['factor_value'].dropna()
-            y = group['future_return'].dropna()
+            x = filtered_group['factor_value'].dropna()
+            y = filtered_group['future_return'].dropna()
             
             # 确保x和y长度一致
             common_idx = x.index.intersection(y.index)
@@ -192,7 +232,13 @@ class MultiFactorAnalyzer:
         
         # 创建分组
         def create_groups_for_date(group):
-            factor = group['factor_value'].dropna()
+            # 应用买入过滤
+            filtered_group = self._filter_tradable_stocks(group, for_buy=True)
+            
+            if len(filtered_group) < n_groups:
+                return pd.Series(index=group.index, dtype=float)
+            
+            factor = filtered_group['factor_value'].dropna()
             
             if len(factor) < n_groups:
                 return pd.Series(index=group.index, dtype=float)
@@ -215,8 +261,23 @@ class MultiFactorAnalyzer:
         factor_data['group'] = group_series.values
         factor_data = factor_data.dropna()
         
-        # 按日期和分组计算平均收益率
-        group_returns = factor_data.groupby(['date', 'group'])['future_return'].mean().unstack(fill_value=np.nan)
+        # 添加卖出过滤相关的列
+        factor_data_with_sell_filter = factor_data.copy()
+        if any(col in factor_data.columns for col in ['limit_down_flag', 'suspended']):
+            factor_data_with_sell_filter = factor_data[['date', 'order_book_id', 'future_return', 'group'] + 
+                                                      [col for col in ['limit_down_flag', 'suspended'] 
+                                                       if col in factor_data.columns]]
+        
+        # 应用卖出过滤（在计算收益率时）
+        def calculate_group_return_with_filter(group):
+            # 过滤掉不能卖出的股票（跌停、停牌）
+            filtered_group = self._filter_tradable_stocks(group, for_buy=False)
+            if len(filtered_group) == 0:
+                return np.nan
+            return filtered_group['future_return'].mean()
+        
+        # 按日期和分组计算平均收益率（应用卖出过滤）
+        group_returns = factor_data_with_sell_filter.groupby(['date', 'group']).apply(calculate_group_return_with_filter).unstack(fill_value=np.nan)
         
         # 确保所有分组都存在
         for g in range(n_groups):
@@ -313,12 +374,17 @@ class MultiFactorAnalyzer:
         # 3. 计算累计IC
         cum_ic_df = ic_df.cumsum()
         
-        # 4. 计算各因子的多空组合收益率
+        # 4. 计算各因子的多空组合收益率和分组累计收益率
         long_short_data = {}
         long_excess_data = {}
+        group_cumulative_returns_data = {}
         
         for factor_name in tqdm(self.aligned_factors.keys(), desc="多空/超额收益计算"):
             group_returns = group_returns_data[factor_name]['group_returns']
+            
+            # 计算分组累计收益率
+            cumulative_returns = (1 + group_returns).cumprod()
+            group_cumulative_returns_data[factor_name] = cumulative_returns
             
             # 第1层和倒1层多空组合
             ls_1_10 = self.calculate_long_short_returns(group_returns, n_groups-1, 0)
@@ -376,7 +442,7 @@ class MultiFactorAnalyzer:
         # 6. 绘制综合图表
         self.plot_comprehensive_analysis(
             stats_df, cum_ic_df, long_excess_data, long_short_data, 
-            performance_stats, save_path=save_path
+            performance_stats, group_cumulative_returns_data, save_path=save_path
         )
         
         # 7. 生成详细报告
@@ -387,6 +453,7 @@ class MultiFactorAnalyzer:
             'cum_ic_df': cum_ic_df,
             'stats_df': stats_df,
             'group_returns_data': group_returns_data,
+            'group_cumulative_returns_data': group_cumulative_returns_data,
             'long_short_data': long_short_data,
             'long_excess_data': long_excess_data,
             'performance_stats': performance_stats
@@ -394,11 +461,12 @@ class MultiFactorAnalyzer:
     
     def plot_comprehensive_analysis(self, stats_df: pd.DataFrame, cum_ic_df: pd.DataFrame,
                                   long_excess_data: Dict, long_short_data: Dict,
-                                  performance_stats: Dict, save_path: Optional[str] = None):
+                                  performance_stats: Dict, group_cumulative_returns_data: Dict, 
+                                  save_path: Optional[str] = None):
         """绘制综合多因子分析图表"""
         print("正在生成多因子分析图表...")
         
-        fig = plt.figure(figsize=(20, 24))
+        fig = plt.figure(figsize=(20, 20))  # 将高度从24改为20，使图表变矮
         gs = fig.add_gridspec(4, 2, height_ratios=[1.5, 2, 2, 2])
         
         # Sheet1: 因子测试统计结果热力图
@@ -423,41 +491,53 @@ class MultiFactorAnalyzer:
         ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax2.grid(True, alpha=0.3)
         
-        # Sheet3: 第1层多头组合累计超额收益率
+        # Sheet3: 第1层多头组合累计超额收益率（使用对数收益率）
         ax3 = fig.add_subplot(gs[1, 1])
         for factor_name in long_excess_data.keys():
             cum_excess_1 = long_excess_data[factor_name]['cum_excess_1']
-            ax3.plot(cum_excess_1.index, cum_excess_1.values, 
+            # 使用对数收益率绘制
+            log_excess_1 = np.log10(cum_excess_1.replace(0, np.nan))
+            ax3.plot(cum_excess_1.index, log_excess_1, 
                     label=factor_name, linewidth=2, alpha=0.8)
-        ax3.set_title('第1层多头组合累计超额收益率', fontsize=14)
+        ax3.set_title('第1层多头组合累计超额对数收益率(log10)', fontsize=14)
         ax3.set_xlabel('日期')
-        ax3.set_ylabel('累计超额收益率')
+        ax3.set_ylabel('累计超额对数收益率(log10)')
         ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax3.grid(True, alpha=0.3)
         
-        # Sheet4: 第1层、倒1层多空组合累计收益率
+        # Sheet4: 第1层、倒1层多空组合累计收益率（使用对数收益率）
         ax4 = fig.add_subplot(gs[2, 0])
         for factor_name in long_short_data.keys():
             cum_ls_1_10 = long_short_data[factor_name]['cum_ls_1_10']
-            ax4.plot(cum_ls_1_10.index, cum_ls_1_10.values, 
+            # 使用对数收益率绘制
+            log_ls_1_10 = np.log10(cum_ls_1_10.replace(0, np.nan))
+            ax4.plot(cum_ls_1_10.index, log_ls_1_10, 
                     label=factor_name, linewidth=2, alpha=0.8)
-        ax4.set_title('第1层、倒1层多空组合累计收益率', fontsize=14)
+        ax4.set_title('第1层、倒1层多空组合累计对数收益率(log10)', fontsize=14)
         ax4.set_xlabel('日期')
-        ax4.set_ylabel('累计收益率')
+        ax4.set_ylabel('累计对数收益率(log10)')
         ax4.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax4.grid(True, alpha=0.3)
         
-        # 第2层、倒2层多空组合累计收益率
+        # 分组累计收益率分箱图（使用对数收益率）
         ax5 = fig.add_subplot(gs[2, 1])
-        for factor_name in long_short_data.keys():
-            cum_ls_2_9 = long_short_data[factor_name]['cum_ls_2_9']
-            ax5.plot(cum_ls_2_9.index, cum_ls_2_9.values, 
-                    label=factor_name, linewidth=2, alpha=0.8)
-        ax5.set_title('第2层、倒2层多空组合累计收益率', fontsize=14)
-        ax5.set_xlabel('日期')
-        ax5.set_ylabel('累计收益率')
-        ax5.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax5.grid(True, alpha=0.3)
+        # 选择第一个因子作为示例显示分组累计收益率
+        if group_cumulative_returns_data:
+            first_factor = list(group_cumulative_returns_data.keys())[0]
+            cumulative_returns = group_cumulative_returns_data[first_factor]
+            n_groups = len(cumulative_returns.columns)
+            
+            for group in range(n_groups):
+                if group in cumulative_returns.columns:
+                    # 使用对数收益率绘制
+                    log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
+                    ax5.plot(cumulative_returns.index, log_returns,
+                             label=f'分组{group+1}', alpha=0.8)
+            ax5.set_title(f'{first_factor} - 各分组累计对数收益率(log10)', fontsize=14)
+            ax5.set_xlabel('日期')
+            ax5.set_ylabel('累计对数收益率(log10)')
+            ax5.legend(loc='upper left', fontsize=8)
+            ax5.grid(True, alpha=0.3)
         
         # 性能对比表格
         ax6 = fig.add_subplot(gs[3, :])
@@ -490,7 +570,7 @@ class MultiFactorAnalyzer:
                          loc='center', cellLoc='center')
         table.auto_set_font_size(False)
         table.set_fontsize(10)
-        table.scale(1.2, 2.0)
+        table.scale(1.2, 1.6)  # 将高度从2.0改为1.6，使表格变矮
         ax6.set_title('多因子性能对比表', fontsize=16, pad=20)
         
         plt.tight_layout()

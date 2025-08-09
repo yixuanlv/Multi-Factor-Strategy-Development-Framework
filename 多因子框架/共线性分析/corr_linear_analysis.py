@@ -81,7 +81,9 @@ class CollinearityAnalyzer:
         for factor_name, factor_data in self.factors_data.items():
             merged_data = pd.merge(
                 factor_data[['date', 'order_book_id', 'factor_value']],
-                returns_data[['date', 'order_book_id', 'return']],
+                returns_data[['date', 'order_book_id', 'return', 'close'] + 
+                            [col for col in ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended'] 
+                             if col in returns_data.columns]],
                 on=['date', 'order_book_id'],
                 how='inner'
             )
@@ -101,10 +103,44 @@ class CollinearityAnalyzer:
         print(f"数据对齐完成：{len(common_dates)}个日期，{len(common_stocks)}只股票")
         print(f"有效因子数量：{len(self.aligned_factors)}")
         
+    def _filter_tradable_stocks(self, data, for_buy=True):
+        """
+        过滤可交易的股票
+        for_buy: True表示买入过滤，False表示卖出过滤
+        """
+        filtered_data = data.copy()
+        
+        # 检查是否存在相关列
+        available_cols = [col for col in ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended'] 
+                         if col in filtered_data.columns]
+        
+        if not available_cols:
+            return filtered_data
+        
+        # 买入过滤：不能买入涨停、ST、停牌、跌停的股票
+        if for_buy:
+            for col in available_cols:
+                if col in filtered_data.columns:
+                    # True表示在该状态，需要过滤掉
+                    mask = ~filtered_data[col].astype(bool)
+                    filtered_data = filtered_data[mask]
+        
+        # 卖出过滤：不能卖出跌停、停牌的股票
+        else:
+            for col in ['limit_down_flag', 'suspended']:
+                if col in filtered_data.columns:
+                    # True表示在该状态，需要过滤掉
+                    mask = ~filtered_data[col].astype(bool)
+                    filtered_data = filtered_data[mask]
+        
+        return filtered_data
+        
     def _calculate_beta_for_date(self, date_data_tuple):
         date, date_data = date_data_tuple
         try:
-            valid_data = date_data[['factor_value', 'future_return']].dropna()
+            # 应用买入过滤
+            filtered_data = self._filter_tradable_stocks(date_data, for_buy=True)
+            valid_data = filtered_data[['factor_value', 'future_return']].dropna()
             if len(valid_data) < 10:
                 return date, np.nan
             X = valid_data['factor_value'].values.reshape(-1, 1)
@@ -151,7 +187,9 @@ class CollinearityAnalyzer:
         serial_result = pd.Series(index=factor_data['date'].unique(), dtype=float)
         for date in factor_data['date'].unique():
             date_data = factor_data[factor_data['date'] == date]
-            valid_data = date_data[['factor_value', 'future_return']].dropna()
+            # 应用买入过滤
+            filtered_date_data = self._filter_tradable_stocks(date_data, for_buy=True)
+            valid_data = filtered_date_data[['factor_value', 'future_return']].dropna()
             if len(valid_data) < 10:
                 serial_result[date] = np.nan
                 continue
@@ -221,9 +259,12 @@ class CollinearityAnalyzer:
         for factor_name, factor_data in self.aligned_factors.items():
             date_data = factor_data[factor_data['date'] == date]
             if len(date_data) > 0:
-                # 处理重复的order_book_id，取第一个值或平均值
-                stock_factor_map = date_data.groupby('order_book_id')['factor_value'].first()
-                factor_data_for_date[factor_name] = stock_factor_map
+                # 应用买入过滤
+                filtered_date_data = self._filter_tradable_stocks(date_data, for_buy=True)
+                if len(filtered_date_data) > 0:
+                    # 处理重复的order_book_id，取第一个值或平均值
+                    stock_factor_map = filtered_date_data.groupby('order_book_id')['factor_value'].first()
+                    factor_data_for_date[factor_name] = stock_factor_map
         if len(factor_data_for_date) < 2:
             return pd.DataFrame()
         all_factors_df = pd.DataFrame(factor_data_for_date)

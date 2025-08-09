@@ -38,10 +38,13 @@ class SingleFactorAnalyzer:
         returns_data = self.returns_data.copy()
         returns_data.sort_values(['order_book_id', 'date'], inplace=True)
         returns_data['return'] = returns_data.groupby('order_book_id')['close'].pct_change().shift(-1)
-        # 合并数据
+        
+        # 合并数据，包含所有需要的列
         merged_data = pd.merge(
             self.factor_data[['date', 'order_book_id', 'factor_value']],
-            returns_data[['date', 'order_book_id', 'return']],
+            returns_data[['date', 'order_book_id', 'return', 'close'] + 
+                        [col for col in ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended'] 
+                         if col in returns_data.columns]],
             on=['date', 'order_book_id'],
             how='inner'
         )
@@ -56,6 +59,38 @@ class SingleFactorAnalyzer:
         print(f"数据对齐完成：{len(merged_data)}条记录")
         print(f"时间范围：{merged_data['date'].min()} 到 {merged_data['date'].max()}")
         print(f"股票数量：{merged_data['order_book_id'].nunique()}")
+
+    def _filter_tradable_stocks(self, data, for_buy=True):
+        """
+        过滤可交易的股票
+        for_buy: True表示买入过滤，False表示卖出过滤
+        """
+        filtered_data = data.copy()
+        
+        # 检查是否存在相关列
+        available_cols = [col for col in ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended'] 
+                         if col in filtered_data.columns]
+        
+        if not available_cols:
+            return filtered_data
+        
+        # 买入过滤：不能买入涨停、ST、停牌、跌停的股票
+        if for_buy:
+            for col in available_cols:
+                if col in filtered_data.columns:
+                    # True表示在该状态，需要过滤掉
+                    mask = ~filtered_data[col].astype(bool)
+                    filtered_data = filtered_data[mask]
+        
+        # 卖出过滤：不能卖出跌停、停牌的股票
+        else:
+            for col in ['limit_down_flag', 'suspended']:
+                if col in filtered_data.columns:
+                    # True表示在该状态，需要过滤掉
+                    mask = ~filtered_data[col].astype(bool)
+                    filtered_data = filtered_data[mask]
+        
+        return filtered_data
 
     def calculate_ic(self, method='spearman'):
         """优化的IC计算，使用向量化操作，支持调仓周期"""
@@ -77,8 +112,14 @@ class SingleFactorAnalyzer:
             if len(group) < 10:
                 return np.nan
 
-            x = group['factor_value'].dropna()
-            y = group['future_return'].dropna()
+            # 应用买入过滤
+            filtered_group = self._filter_tradable_stocks(group, for_buy=True)
+            
+            if len(filtered_group) < 10:
+                return np.nan
+
+            x = filtered_group['factor_value'].dropna()
+            y = filtered_group['future_return'].dropna()
 
             # 确保x和y长度一致
             common_idx = x.index.intersection(y.index)
@@ -136,7 +177,13 @@ class SingleFactorAnalyzer:
         print("正在创建分组...")
 
         def create_groups_for_date(group):
-            factor = group['factor_value'].dropna()
+            # 应用买入过滤
+            filtered_group = self._filter_tradable_stocks(group, for_buy=True)
+            
+            if len(filtered_group) < n_groups:
+                return pd.Series(index=group.index, dtype=float)
+
+            factor = filtered_group['factor_value'].dropna()
 
             if len(factor) < n_groups:
                 return pd.Series(index=group.index, dtype=float)
@@ -182,7 +229,9 @@ class SingleFactorAnalyzer:
 
         # 合并分组信息
         merged_with_groups = pd.merge(
-            merged_data[['date', 'order_book_id', 'future_return']],
+            merged_data[['date', 'order_book_id', 'future_return'] + 
+                       [col for col in ['limit_down_flag', 'suspended'] 
+                        if col in merged_data.columns]],
             group_labels,
             on=['date', 'order_book_id'],
             how='inner'
@@ -191,8 +240,16 @@ class SingleFactorAnalyzer:
         # 去除缺失值
         merged_with_groups = merged_with_groups.dropna()
 
-        # 按日期和分组计算平均收益率
-        group_returns = merged_with_groups.groupby(['date', 'group'])['future_return'].mean().unstack(fill_value=np.nan)
+        # 应用卖出过滤（在计算收益率时）
+        def calculate_group_return_with_filter(group):
+            # 过滤掉不能卖出的股票（跌停、停牌）
+            filtered_group = self._filter_tradable_stocks(group, for_buy=False)
+            if len(filtered_group) == 0:
+                return np.nan
+            return filtered_group['future_return'].mean()
+
+        # 按日期和分组计算平均收益率（应用卖出过滤）
+        group_returns = merged_with_groups.groupby(['date', 'group']).apply(calculate_group_return_with_filter).unstack(fill_value=np.nan)
 
         # 确保所有分组都存在
         for g in range(n_groups):
@@ -302,7 +359,7 @@ class SingleFactorAnalyzer:
             df[col] = df[col] * 100
         return df
 
-    def plot_full_analysis(self, method='spearman', n_groups=10, figsize=(14, 26), show_plot=True, 
+    def plot_full_analysis(self, method='spearman', n_groups=10, figsize=(14, 22), show_plot=True, 
                           precomputed_data=None, save_path=None):
         """
         新排版：两列四行！
@@ -440,10 +497,12 @@ class SingleFactorAnalyzer:
         ax2 = fig.add_subplot(gs[0, 1])
         for group in range(n_groups):
             if group in cumulative_returns.columns:
-                ax2.plot(cumulative_returns.index, cumulative_returns[group],
+                # 仅用于分箱图，使用底数为10的对数收益率
+                log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
+                ax2.plot(cumulative_returns.index, log_returns,
                          label=f'分组{group+1}', alpha=0.8)
-        ax2.set_title(f'{self.factor_name} - 各分组累计收益率')
-        ax2.set_ylabel('累计收益率')
+        ax2.set_title(f'{self.factor_name} - 各分组累计对数收益率(log10)')
+        ax2.set_ylabel('累计对数收益率(log10)')
         ax2.legend(loc='upper left', fontsize=8)
         ax2.grid(True, alpha=0.3)
 
@@ -504,7 +563,7 @@ class SingleFactorAnalyzer:
         table = ax7.table(cellText=table_data, colLabels=col_labels, loc='center', cellLoc='center')
         table.auto_set_font_size(False)
         table.set_fontsize(12)
-        table.scale(1.1, 2.0)
+        table.scale(1.1, 1.6)  # 这里将高度缩小一点（原来2.0，现为1.6）
         ax7.set_title('', fontsize=13, pad=10)
 
         plt.tight_layout(rect=[0, 0, 1, 1])

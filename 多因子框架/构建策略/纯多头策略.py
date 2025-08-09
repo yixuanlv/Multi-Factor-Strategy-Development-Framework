@@ -8,7 +8,7 @@ rq.init('license', 'B1T4WrPGQ0YBin6JPZm_DlLj3JGxAiuGzi9-SuUNqOUce6MrZ7yLejN2O9OW
 
 config_0 = {
     "base": {
-        "start_date": "2019-01-01",
+        "start_date": "2010-01-01",
         "end_date": "2025-07-22",
         "stock_commission_multiplier": 0.125,
         "frequency": "1d",
@@ -30,8 +30,7 @@ def init(context):
     scheduler.run_weekly(rebalance, tradingday=1)  # 每周一开盘调仓
     # 股票池为A股所有股票
     context.stocks = all_instruments(type='CS', date=None)['order_book_id'].tolist()
-    # 选取市值最小的前100只股票
-    context.stock_num = 500
+    # context.stock_num 不再在init中设置，改为在rebalance中动态计算
     # 预加载factor_data.pkl
     context.factor_data = pd.read_pickle(r"C:\Users\9shao\Desktop\本地化\rqalpha-localization\测试代码\因子数据\multivariate_rolling_120_复合因子_长数据.pkl")
     # 确保order_book_id为字符串
@@ -75,6 +74,11 @@ def rebalance(context, bar_dict):
             continue
     # 保留df['order_book_id']不在out_stocks的部分
     df_target = df_target[~df_target['order_book_id'].isin(out_stocks)]
+
+    # 动态计算目标持仓股票数：当前未停牌未退市未ST股票的10%
+    valid_stock_num = len(df_target)
+    context.stock_num = max(1, int(valid_stock_num * 0.1))  # 至少持有1只
+
     small_cap_stocks = df_target.sort_values('factor', ascending=False).head(context.stock_num)['order_book_id'].tolist()
 
     # 卖出不在小市值池中的股票

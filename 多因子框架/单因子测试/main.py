@@ -119,7 +119,7 @@ def main(factor_name):
             factor_name=factor_name,
             n_groups=10,
             method='spearman',
-            rebalance_period=1,
+            rebalance_period=5,
             save_path=image_save_path
         )
         
@@ -158,4 +158,4 @@ def main(factor_name):
         traceback.print_exc()
 
 if __name__ == "__main__":
-    main( factor_name='str')
+    main( factor_name='multivariate_rolling_120_复合因子')

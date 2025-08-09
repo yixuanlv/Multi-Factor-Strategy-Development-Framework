@@ -91,9 +91,10 @@ def prepare_data(data, factors_data):
 def main(factor_names=None):
     """主函数"""
     if factor_names is None:
-        factor_names = ['beta', 'book_to_price', 'comovement', 'earnings_yield', 
+        # 默认分析所有可用因子
+        factor_names = ['beta', 'book_to_price', 'earnings_yield', 
                        'growth', 'leverage', 'liquidity', 'momentum', 
-                       'residual_volatility', 'size', 'str']
+                       'residual_volatility', 'size', 'str', 'multivariate_rolling_120_复合因子']
     
     print("=" * 60)
     print(f"多因子集中测试分析")
@@ -120,8 +121,10 @@ def main(factor_names=None):
         # 进行多因子分析
         print("\n开始多因子集中测试分析...")
         
-        # 准备图片保存路径
-        image_save_path = f"../测试结果/多因子集中测试_分析结果.png"
+        # 所有输出文件都放在 测试结果/多因子集中测试结果 目录下
+        output_dir = os.path.join(work_dir, "../测试结果/多因子集中测试结果")
+        os.makedirs(output_dir, exist_ok=True)
+        image_save_path = os.path.join(output_dir, "多因子集中测试_分析结果.png")
         
         results = analyze_multiple_factors(
             factors_data=factors_data_ready,
@@ -133,10 +136,6 @@ def main(factor_names=None):
         )
         
         print("\n多因子分析完成！")
-        
-        # 保存结果
-        output_dir = f"../测试结果/多因子集中测试结果"
-        os.makedirs(output_dir, exist_ok=True)
         
         # 保存IC数据
         ic_df = results['ic_df']
@@ -233,5 +232,23 @@ def main(factor_names=None):
         import traceback
         traceback.print_exc()
 
+def analyze_specific_factors(factor_list):
+    """分析指定的因子列表"""
+    print(f"分析指定因子: {factor_list}")
+    main(factor_list)
+
+def analyze_all_factors():
+    """分析所有可用因子"""
+    print("分析所有可用因子")
+    main()
+
 if __name__ == "__main__":
-    main()  # 不写就是分析所有因子
+    import sys
+    
+    if len(sys.argv) > 1:
+        # 如果提供了命令行参数，使用指定的因子
+        factor_list = sys.argv[1:]
+        analyze_specific_factors(factor_list)
+    else:
+        # 否则分析所有因子
+        analyze_all_factors()
