@@ -158,4 +158,4 @@ def main(factor_name):
         traceback.print_exc()
 
 if __name__ == "__main__":
-    main( factor_name='volatility_250_factor')
+    main( factor_name='size')
