@@ -32,7 +32,7 @@ def init(context):
     context.stocks = all_instruments(type='CS', date=None)['order_book_id'].tolist()
     # context.stock_num 不再在init中设置，改为在rebalance中动态计算
     # 预加载factor_data.pkl
-    context.factor_data = pd.read_pickle(r"C:\Users\9shao\Desktop\本地化\rqalpha-localization\测试代码\因子数据\multivariate_rolling_120_复合因子_长数据.pkl")
+    context.factor_data = pd.read_pickle(r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\测试代码\因子数据\multivariate_rolling_120_复合因子_长数据.pkl")
     # 确保order_book_id为字符串
     context.factor_data['order_book_id'] = context.factor_data['order_book_id'].astype(str)
 
