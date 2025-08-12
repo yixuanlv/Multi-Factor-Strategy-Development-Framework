@@ -25,11 +25,11 @@ def print_memory_usage(stage=""):
     print(f"内存使用 {stage}: {memory_mb:.1f} MB")
 
 # 初始化米筐接口
-rq.init('license', 'I6eb8ljE6tv9DWcYa3F0hERxbDdQ3f0RZzgBEnTHuaQlVX56azMDhdh6dYB42IJ7onLu0mAl3A1rRGFVTQuxE4jZcwoByZaySYlNuInciyFGarrHTz24mblwqbrC4RaCvKbkxP-tZ9S7ZjDY8pTNWu4uIslVXYb4XXL9NSwGI58=T7bU8OlDqvS3R5pPNN7s3PsfirJTCFSHPXpm5Ak3n0Dpzaze0NLbHWfZ-JcnlTBz7Oxec6dmkH9X4UB0OT0qxlkHA3pX_muOZI_zgMpCNZFH1wZ-DjeEMXrkqGGBKIo6_rZeaz130Fo1PLRY-rTw71gPmhD1oVg7GVh1kC7SWrk=') 
+rq.init('license', 'OUAxlh6_oGHkXZTE9SFuLXmbAabdkJl7b56FkXfo6pxo4tTpNRgneD0Qhbd6YAadaZ2VWGwF5_INmA9IB3EE0jd_JKIh0doSG0hC1JSHFDnSS5ie66IcA_mS0uG1Ac0gJq_QpdPrwxgUanfN_vZs0doGxzK9hPwprFlN5xPuVR0=IfuVvS_P3IFvpPIGQfh8S7Ri7U4K-BFhJGxNh8H2TzquUeEnbeLhCBSuMasPFoK-khXZhSsYv-tM8LWulhCPpowQoOIp2Xw-7TRlALTNTIhsYJnisfrBHbt34XOmtd30xDRDtFzcIZfPTBIbk-K9pL40wv0JplN1YLaYO-TYmQc=') 
 
 # 筹码峰因子参数
-CHIP_WINDOW = 250  # 筹码留存窗口，进一步精简为30日滚动用于测试
-START_DATE = '2015-01-01'  # 缩小时间范围以加快测试
+CHIP_WINDOW = 60  # 筹码留存窗口，进一步精简为30日滚动用于测试
+START_DATE = '2020-01-01'  # 缩小时间范围以加快测试
 END_DATE = '2025-07-31'
 
 def get_stock_data(start_date, end_date, max_stocks=None):
