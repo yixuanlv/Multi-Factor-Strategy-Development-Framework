@@ -9,7 +9,20 @@ import rqdatac as rq
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import warnings
+import psutil
 warnings.filterwarnings('ignore')
+
+def get_memory_usage():
+    """获取当前内存使用情况"""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024
+    return memory_mb
+
+def print_memory_usage(stage=""):
+    """打印内存使用情况"""
+    memory_mb = get_memory_usage()
+    print(f"内存使用 {stage}: {memory_mb:.1f} MB")
 
 # 初始化米筐接口
 rq.init('license', 'I6eb8ljE6tv9DWcYa3F0hERxbDdQ3f0RZzgBEnTHuaQlVX56azMDhdh6dYB42IJ7onLu0mAl3A1rRGFVTQuxE4jZcwoByZaySYlNuInciyFGarrHTz24mblwqbrC4RaCvKbkxP-tZ9S7ZjDY8pTNWu4uIslVXYb4XXL9NSwGI58=T7bU8OlDqvS3R5pPNN7s3PsfirJTCFSHPXpm5Ak3n0Dpzaze0NLbHWfZ-JcnlTBz7Oxec6dmkH9X4UB0OT0qxlkHA3pX_muOZI_zgMpCNZFH1wZ-DjeEMXrkqGGBKIo6_rZeaz130Fo1PLRY-rTw71gPmhD1oVg7GVh1kC7SWrk=') 
@@ -115,7 +128,7 @@ def get_stock_data(start_date, end_date, max_stocks=None):
     return data
 
 def calculate_single_stock_chips(args):
-    """单只股票的筹码留存计算 - 高度向量化版本"""
+    """单只股票的筹码留存计算 - 内存优化版本"""
     stock, stock_data, window = args
     
     if len(stock_data) < window:
@@ -128,19 +141,7 @@ def calculate_single_stock_chips(args):
     volumes = stock_data['volume'].values
     vwaps = stock_data['vwap'].values
     
-    # 预计算换手率衰减矩阵 - 使用更高效的算法
-    # 使用累积乘积的向量化操作
-    turnover_matrix = np.ones((n_days, n_days))
-    
-    # 使用向量化操作填充下三角矩阵
-    for i in range(1, n_days):
-        # 计算从0到i-1的累积换手率衰减
-        if i > 0:
-            # 使用cumprod的向量化操作
-            decay_factors = np.cumprod(1 - turnover_rates[:i])[::-1]  # 反转顺序
-            turnover_matrix[i, :i] = decay_factors
-    
-    # 计算筹码留存矩阵 - 完全向量化
+    # 内存优化：只计算需要的部分，避免创建完整矩阵
     chip_retention = np.zeros((n_days, window))
     historical_vwap = np.zeros((n_days, window))
     
@@ -148,7 +149,7 @@ def calculate_single_stock_chips(args):
     chip_retention[:, 0] = volumes
     historical_vwap[:, 0] = vwaps
     
-    # 历史数据 - 使用向量化操作
+    # 历史数据 - 使用分块计算避免内存溢出
     for k in range(1, min(window, n_days)):
         # 创建索引数组
         valid_indices = np.arange(k, n_days)
@@ -157,8 +158,17 @@ def calculate_single_stock_chips(args):
             hist_volumes = volumes[valid_indices - k]
             hist_vwaps = vwaps[valid_indices - k]
             
-            # 获取对应的换手率衰减 - 向量化索引
-            decay_values = turnover_matrix[valid_indices, valid_indices - k]
+            # 计算换手率衰减 - 使用向量化操作但避免大矩阵
+            if k == 1:
+                # 对于k=1，直接使用1-turnover
+                decay_values = 1 - turnover_rates[valid_indices - k + 1]
+            else:
+                # 对于k>1，使用累积乘积但只计算需要的部分
+                decay_values = np.ones(len(valid_indices))
+                for i, idx in enumerate(valid_indices):
+                    if idx - k + 1 <= idx:
+                        # 计算从idx-k+1到idx的换手率累积衰减
+                        decay_values[i] = np.prod(1 - turnover_rates[idx - k + 1:idx + 1])
             
             # 计算筹码留存
             chip_retention[valid_indices, k] = hist_volumes * decay_values
@@ -178,39 +188,56 @@ def calculate_single_stock_chips(args):
     return result_df
 
 def calculate_chip_retention_optimized(df, window=CHIP_WINDOW):
-    """优化的筹码留存计算 - 多核并行+完全向量化版本
+    """优化的筹码留存计算 - 内存优化+多核并行版本
     按照理论：RSDAmt(T,T-k) = Amt(T-k)*cumprod(1-Turnover(i))(T,T-k+1); k = (0,250]
-    使用多核并行和完全向量化操作大幅提高效率
+    使用内存优化和多核并行操作大幅提高效率
     """
-    print("正在计算筹码留存（多核并行+向量化版本）...")
+    print("正在计算筹码留存（内存优化+多核并行版本）...")
     
     # 准备并行计算参数
     stocks = df['order_book_id'].unique()
     print(f"使用 {cpu_count()} 个CPU核心进行并行计算...")
+    print(f"处理 {len(stocks)} 只股票...")
     
-    # 准备数据
-    stock_data_list = []
-    for stock in stocks:
-        stock_data = df[df['order_book_id'] == stock].copy()
-        stock_data = stock_data.sort_values('date').reset_index(drop=True)
-        stock_data_list.append((stock, stock_data, window))
+    # 内存优化：分批处理避免内存溢出
+    batch_size = 100  # 每批处理100只股票
+    all_results = []
     
-    # 使用多核并行计算
-    with Pool(processes=cpu_count()) as pool:
-        results = list(tqdm(
-            pool.imap(calculate_single_stock_chips, stock_data_list),
-            total=len(stock_data_list),
-            desc="并行计算筹码留存"
-        ))
+    for batch_start in range(0, len(stocks), batch_size):
+        batch_end = min(batch_start + batch_size, len(stocks))
+        batch_stocks = stocks[batch_start:batch_end]
+        
+        print(f"处理批次 {batch_start//batch_size + 1}/{(len(stocks)-1)//batch_size + 1}: 股票 {batch_start+1}-{batch_end}")
+        
+        # 准备批次数据
+        stock_data_list = []
+        for stock in batch_stocks:
+            stock_data = df[df['order_book_id'] == stock].copy()
+            stock_data = stock_data.sort_values('date').reset_index(drop=True)
+            stock_data_list.append((stock, stock_data, window))
+        
+        # 使用多核并行计算当前批次
+        with Pool(processes=min(cpu_count(), len(batch_stocks))) as pool:
+            batch_results = list(tqdm(
+                pool.imap(calculate_single_stock_chips, stock_data_list),
+                total=len(stock_data_list),
+                desc=f"批次 {batch_start//batch_size + 1} 并行计算"
+            ))
+        
+        # 过滤掉None结果并添加到总结果
+        batch_results = [r for r in batch_results if r is not None]
+        all_results.extend(batch_results)
+        
+        # 清理内存
+        del batch_results
+        del stock_data_list
     
-    # 过滤掉None结果
-    results = [r for r in results if r is not None]
-    
-    if not results:
+    if not all_results:
         raise ValueError("没有足够的股票数据计算筹码留存")
     
     # 合并所有股票的结果
-    final_result = pd.concat(results, ignore_index=True)
+    print("合并所有批次结果...")
+    final_result = pd.concat(all_results, ignore_index=True)
     print("筹码留存计算完成")
     return final_result
 
@@ -351,23 +378,29 @@ def save_factor_data(df, factor_name):
 
 def main():
     """主函数"""
-    print("开始构造筹码峰因子（多核并行+超高效向量化版本）...")
+    print("开始构造筹码峰因子（内存优化+多核并行版本）...")
+    print_memory_usage("开始")
     
     try:
         # 1. 获取股票数据（使用较小数量进行测试，验证优化效果）
         df = get_stock_data(START_DATE, END_DATE, max_stocks=None)  # 先测试50只股票
+        print_memory_usage("获取数据后")
         
         # 2. 计算筹码留存
         chip_df = calculate_chip_retention_optimized(df, CHIP_WINDOW)
+        print_memory_usage("筹码留存计算后")
         
         # 3. 计算筹码收益因子
         result_df = calculate_holding_return_optimized(df, chip_df, CHIP_WINDOW)
+        print_memory_usage("筹码收益因子计算后")
         
         # 4. 计算市场筹码收益
         market_df = calculate_market_holding_return(result_df)
+        print_memory_usage("市场筹码收益计算后")
         
         # 5. 计算筹码收益调整因子
         final_df = calculate_adjusted_factor(result_df, market_df)
+        print_memory_usage("调整因子计算后")
         
         # 6. 保存因子数据
         print("\n=== 保存因子数据 ===")
@@ -382,6 +415,7 @@ def main():
         market_matrix = save_factor_data(market_df, 'mkt_holding_ret')
         
         print("\n筹码峰因子构造完成！")
+        print_memory_usage("完成")
         
         # 显示因子统计信息
         print("\n=== 因子统计信息 ===")

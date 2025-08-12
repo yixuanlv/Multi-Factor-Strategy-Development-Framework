@@ -360,9 +360,10 @@ class SingleFactorAnalyzer:
         return df
 
     def plot_full_analysis(self, method='spearman', n_groups=10, figsize=(14, 22), show_plot=True, 
-                          precomputed_data=None, save_path=None):
+                          precomputed_data=None, save_path=None, show_log_returns=True):
         """
         新排版：两列四行！
+        show_log_returns: 是否绘制对数收益的分箱图，默认为True
         """
         if precomputed_data is None:
             print("正在计算分析数据...")
@@ -407,7 +408,9 @@ class SingleFactorAnalyzer:
                 'total_return': cumulative_ls_returns.iloc[-1] - 1 if len(cumulative_ls_returns) > 0 else np.nan
             }
 
-            avg_returns = group_returns.mean()
+            # 计算分组累计收益
+            cumulative_returns = (1 + group_returns).cumprod()
+            group_cumulative_returns = cumulative_returns.iloc[-1] if len(cumulative_returns) > 0 else pd.Series([np.nan] * n_groups)
         else:
             # 使用预计算的数据
             ic_stats = precomputed_data['ic_stats']
@@ -425,9 +428,10 @@ class SingleFactorAnalyzer:
             long_short_returns = precomputed_data['long_short_returns']['long_short_returns']
             cumulative_ls_returns = precomputed_data['long_short_returns']['cumulative_ls_returns']
             running_max = cumulative_ls_returns.expanding().max()
-            drawdown = (cumulative_ls_returns - running_max) / running_max
+            drawdown = (cumulative_ls_returns - cumulative_ls_returns.expanding().max()) / cumulative_ls_returns.expanding().max()
             ls_stats = precomputed_data['long_short_stats']
-            avg_returns = group_returns.mean()
+            # 计算分组累计收益
+            group_cumulative_returns = cumulative_returns.iloc[-1] if len(cumulative_returns) > 0 else pd.Series([np.nan] * n_groups)
         stats = ls_stats
         ic_stats_text = (
             f"\nIC均值: {ic_stats['IC_mean']:.4f}"
@@ -495,14 +499,22 @@ class SingleFactorAnalyzer:
 
         # 2. 各分组累计收益率（第1行第2列）
         ax2 = fig.add_subplot(gs[0, 1])
-        for group in range(n_groups):
-            if group in cumulative_returns.columns:
-                # 仅用于分箱图，使用底数为10的对数收益率
-                log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
-                ax2.plot(cumulative_returns.index, log_returns,
-                         label=f'分组{group+1}', alpha=0.8)
-        ax2.set_title(f'{self.factor_name} - 各分组累计对数收益率(log10)')
-        ax2.set_ylabel('累计对数收益率(log10)')
+        if show_log_returns:
+            for group in range(n_groups):
+                if group in cumulative_returns.columns:
+                    # 仅用于分箱图，使用底数为10的对数收益率
+                    log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
+                    ax2.plot(cumulative_returns.index, log_returns,
+                             label=f'分组{group+1}', alpha=0.8)
+            ax2.set_title(f'{self.factor_name} - 各分组累计对数收益率(log10)')
+            ax2.set_ylabel('累计对数收益率(log10)')
+        else:
+            for group in range(n_groups):
+                if group in cumulative_returns.columns:
+                    ax2.plot(cumulative_returns.index, cumulative_returns[group],
+                             label=f'分组{group+1}', alpha=0.8)
+            ax2.set_title(f'{self.factor_name} - 各分组累计收益率')
+            ax2.set_ylabel('累计收益率')
         ax2.legend(loc='upper left', fontsize=8)
         ax2.grid(True, alpha=0.3)
 
@@ -524,12 +536,12 @@ class SingleFactorAnalyzer:
         handles, labels = ax3.get_legend_handles_labels()
         ax3.legend(handles, labels, loc='upper left', fontsize=8)
 
-        # 4. 分组平均收益率（第2行第2列）
+        # 4. 分组累计收益率（第2行第2列）
         ax4 = fig.add_subplot(gs[1, 1])
-        ax4.bar(range(n_groups), avg_returns.values, alpha=0.7)
-        ax4.set_title(f'{self.factor_name} - 各分组平均收益率')
+        ax4.bar(range(n_groups), group_cumulative_returns.values, alpha=0.7)
+        ax4.set_title(f'{self.factor_name} - 各分组累计收益率')
         ax4.set_xlabel('分组')
-        ax4.set_ylabel('平均收益率')
+        ax4.set_ylabel('累计收益率')
         ax4.grid(True, alpha=0.3)
 
         # 5. IC统计信息文本（第3行第1列）
@@ -577,7 +589,7 @@ class SingleFactorAnalyzer:
             plt.show()
         return fig
 
-    def generate_report(self, n_groups=10, method='spearman', save_path=None):
+    def generate_report(self, n_groups=10, method='spearman', save_path=None, show_log_returns=True):
         print("=" * 50)
         print(f"因子分析报告: {self.factor_name}")
         print(f"调仓周期: {self.rebalance_period}")
@@ -647,7 +659,7 @@ class SingleFactorAnalyzer:
             'long_short_stats': stats
         }
 
-        self.plot_full_analysis(method=method, n_groups=n_groups, precomputed_data=precomputed_data, save_path=save_path)
+        self.plot_full_analysis(method=method, n_groups=n_groups, precomputed_data=precomputed_data, save_path=save_path, show_log_returns=show_log_returns)
 
         return {
             'ic_stats': ic_stats,
@@ -664,6 +676,6 @@ class SingleFactorAnalyzer:
         }
 
 
-def analyze_single_factor(factor_data, returns_data, factor_name='factor', n_groups=10, method='spearman', rebalance_period=1, save_path=None):
+def analyze_single_factor(factor_data, returns_data, factor_name='factor', n_groups=10, method='spearman', rebalance_period=1, save_path=None, show_log_returns=True):
     analyzer = SingleFactorAnalyzer(factor_data, returns_data, factor_name, rebalance_period)
-    return analyzer.generate_report(n_groups, method, save_path)
+    return analyzer.generate_report(n_groups, method, save_path, show_log_returns)
