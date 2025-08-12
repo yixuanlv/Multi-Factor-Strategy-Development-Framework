@@ -188,56 +188,41 @@ def calculate_single_stock_chips(args):
     return result_df
 
 def calculate_chip_retention_optimized(df, window=CHIP_WINDOW):
-    """优化的筹码留存计算 - 内存优化+多核并行版本
+    """优化的筹码留存计算 - 直接多核并行版本
     按照理论：RSDAmt(T,T-k) = Amt(T-k)*cumprod(1-Turnover(i))(T,T-k+1); k = (0,250]
-    使用内存优化和多核并行操作大幅提高效率
+    使用直接多核并行操作大幅提高效率
     """
-    print("正在计算筹码留存（内存优化+多核并行版本）...")
+    print("正在计算筹码留存（直接多核并行版本）...")
     
     # 准备并行计算参数
     stocks = df['order_book_id'].unique()
     print(f"使用 {cpu_count()} 个CPU核心进行并行计算...")
     print(f"处理 {len(stocks)} 只股票...")
     
-    # 内存优化：分批处理避免内存溢出
-    batch_size = 100  # 每批处理100只股票
-    all_results = []
+    # 直接准备所有股票数据
+    stock_data_list = []
+    for stock in stocks:
+        stock_data = df[df['order_book_id'] == stock].copy()
+        stock_data = stock_data.sort_values('date').reset_index(drop=True)
+        stock_data_list.append((stock, stock_data, window))
     
-    for batch_start in range(0, len(stocks), batch_size):
-        batch_end = min(batch_start + batch_size, len(stocks))
-        batch_stocks = stocks[batch_start:batch_end]
-        
-        print(f"处理批次 {batch_start//batch_size + 1}/{(len(stocks)-1)//batch_size + 1}: 股票 {batch_start+1}-{batch_end}")
-        
-        # 准备批次数据
-        stock_data_list = []
-        for stock in batch_stocks:
-            stock_data = df[df['order_book_id'] == stock].copy()
-            stock_data = stock_data.sort_values('date').reset_index(drop=True)
-            stock_data_list.append((stock, stock_data, window))
-        
-        # 使用多核并行计算当前批次
-        with Pool(processes=min(cpu_count(), len(batch_stocks))) as pool:
-            batch_results = list(tqdm(
-                pool.imap(calculate_single_stock_chips, stock_data_list),
-                total=len(stock_data_list),
-                desc=f"批次 {batch_start//batch_size + 1} 并行计算"
-            ))
-        
-        # 过滤掉None结果并添加到总结果
-        batch_results = [r for r in batch_results if r is not None]
-        all_results.extend(batch_results)
-        
-        # 清理内存
-        del batch_results
-        del stock_data_list
+    # 使用多核并行计算所有股票
+    with Pool(processes=cpu_count()) as pool:
+        results = list(tqdm(
+            pool.imap(calculate_single_stock_chips, stock_data_list),
+            total=len(stock_data_list),
+            desc="多核并行计算筹码留存"
+        ))
     
-    if not all_results:
+    # 过滤掉None结果
+    results = [r for r in results if r is not None]
+    
+    if not results:
         raise ValueError("没有足够的股票数据计算筹码留存")
     
     # 合并所有股票的结果
-    print("合并所有批次结果...")
-    final_result = pd.concat(all_results, ignore_index=True)
+    print("合并所有股票结果...")
+    final_result = pd.concat(results, ignore_index=True)
     print("筹码留存计算完成")
     return final_result
 
@@ -378,7 +363,7 @@ def save_factor_data(df, factor_name):
 
 def main():
     """主函数"""
-    print("开始构造筹码峰因子（内存优化+多核并行版本）...")
+    print("开始构造筹码峰因子（直接多核并行版本）...")
     print_memory_usage("开始")
     
     try:

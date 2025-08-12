@@ -356,7 +356,7 @@ class MultiFactorAnalyzer:
         }
     
     def generate_comprehensive_report(self, n_groups: int = 10, method: str = 'spearman', 
-                                    save_path: Optional[str] = None) -> Dict:
+                                    save_path: Optional[str] = None, show_log_returns: bool = True) -> Dict:
         """生成综合多因子分析报告"""
         print("=" * 60)
         print("多因子集中测试分析报告")
@@ -442,7 +442,7 @@ class MultiFactorAnalyzer:
         # 6. 绘制综合图表
         self.plot_comprehensive_analysis(
             stats_df, cum_ic_df, long_excess_data, long_short_data, 
-            performance_stats, group_cumulative_returns_data, save_path=save_path
+            performance_stats, group_cumulative_returns_data, save_path=save_path, show_log_returns=show_log_returns
         )
         
         # 7. 生成详细报告
@@ -462,7 +462,7 @@ class MultiFactorAnalyzer:
     def plot_comprehensive_analysis(self, stats_df: pd.DataFrame, cum_ic_df: pd.DataFrame,
                                   long_excess_data: Dict, long_short_data: Dict,
                                   performance_stats: Dict, group_cumulative_returns_data: Dict, 
-                                  save_path: Optional[str] = None):
+                                  save_path: Optional[str] = None, show_log_returns: bool = True):
         """绘制综合多因子分析图表"""
         print("正在生成多因子分析图表...")
         
@@ -491,35 +491,55 @@ class MultiFactorAnalyzer:
         ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax2.grid(True, alpha=0.3)
         
-        # Sheet3: 第1层多头组合累计超额收益率（使用对数收益率）
+        # Sheet3: 第1层多头组合累计超额收益率
         ax3 = fig.add_subplot(gs[1, 1])
         for factor_name in long_excess_data.keys():
             cum_excess_1 = long_excess_data[factor_name]['cum_excess_1']
-            # 使用对数收益率绘制
-            log_excess_1 = np.log10(cum_excess_1.replace(0, np.nan))
-            ax3.plot(cum_excess_1.index, log_excess_1, 
-                    label=factor_name, linewidth=2, alpha=0.8)
-        ax3.set_title('第1层多头组合累计超额对数收益率(log10)', fontsize=14)
+            if show_log_returns:
+                # 使用对数收益率绘制
+                log_excess_1 = np.log10(cum_excess_1.replace(0, np.nan))
+                ax3.plot(cum_excess_1.index, log_excess_1, 
+                        label=factor_name, linewidth=2, alpha=0.8)
+            else:
+                # 使用普通收益率绘制
+                ax3.plot(cum_excess_1.index, cum_excess_1, 
+                        label=factor_name, linewidth=2, alpha=0.8)
+        
+        if show_log_returns:
+            ax3.set_title('第1层多头组合累计超额对数收益率(log10)', fontsize=14)
+            ax3.set_ylabel('累计超额对数收益率(log10)')
+        else:
+            ax3.set_title('第1层多头组合累计超额收益率', fontsize=14)
+            ax3.set_ylabel('累计超额收益率')
         ax3.set_xlabel('日期')
-        ax3.set_ylabel('累计超额对数收益率(log10)')
         ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax3.grid(True, alpha=0.3)
         
-        # Sheet4: 第1层、倒1层多空组合累计收益率（使用对数收益率）
+        # Sheet4: 第1层、倒1层多空组合累计收益率
         ax4 = fig.add_subplot(gs[2, 0])
         for factor_name in long_short_data.keys():
             cum_ls_1_10 = long_short_data[factor_name]['cum_ls_1_10']
-            # 使用对数收益率绘制
-            log_ls_1_10 = np.log10(cum_ls_1_10.replace(0, np.nan))
-            ax4.plot(cum_ls_1_10.index, log_ls_1_10, 
-                    label=factor_name, linewidth=2, alpha=0.8)
-        ax4.set_title('第1层、倒1层多空组合累计对数收益率(log10)', fontsize=14)
+            if show_log_returns:
+                # 使用对数收益率绘制
+                log_ls_1_10 = np.log10(cum_ls_1_10.replace(0, np.nan))
+                ax4.plot(cum_ls_1_10.index, log_ls_1_10, 
+                        label=factor_name, linewidth=2, alpha=0.8)
+            else:
+                # 使用普通收益率绘制
+                ax4.plot(cum_ls_1_10.index, cum_ls_1_10, 
+                        label=factor_name, linewidth=2, alpha=0.8)
+        
+        if show_log_returns:
+            ax4.set_title('第1层、倒1层多空组合累计对数收益率(log10)', fontsize=14)
+            ax4.set_ylabel('累计对数收益率(log10)')
+        else:
+            ax4.set_title('第1层、倒1层多空组合累计收益率', fontsize=14)
+            ax4.set_ylabel('累计收益率')
         ax4.set_xlabel('日期')
-        ax4.set_ylabel('累计对数收益率(log10)')
         ax4.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax4.grid(True, alpha=0.3)
         
-        # 分组累计收益率分箱图（使用对数收益率）
+        # 分组累计收益率分箱图
         ax5 = fig.add_subplot(gs[2, 1])
         # 选择第一个因子作为示例显示分组累计收益率
         if group_cumulative_returns_data:
@@ -529,13 +549,23 @@ class MultiFactorAnalyzer:
             
             for group in range(n_groups):
                 if group in cumulative_returns.columns:
-                    # 使用对数收益率绘制
-                    log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
-                    ax5.plot(cumulative_returns.index, log_returns,
-                             label=f'分组{group+1}', alpha=0.8)
-            ax5.set_title(f'{first_factor} - 各分组累计对数收益率(log10)', fontsize=14)
+                    if show_log_returns:
+                        # 使用对数收益率绘制
+                        log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
+                        ax5.plot(cumulative_returns.index, log_returns,
+                                 label=f'分组{group+1}', alpha=0.8)
+                    else:
+                        # 使用普通收益率绘制
+                        ax5.plot(cumulative_returns.index, cumulative_returns[group],
+                                 label=f'分组{group+1}', alpha=0.8)
+            
+            if show_log_returns:
+                ax5.set_title(f'{first_factor} - 各分组累计对数收益率(log10)', fontsize=14)
+                ax5.set_ylabel('累计对数收益率(log10)')
+            else:
+                ax5.set_title(f'{first_factor} - 各分组累计收益率', fontsize=14)
+                ax5.set_ylabel('累计收益率')
             ax5.set_xlabel('日期')
-            ax5.set_ylabel('累计对数收益率(log10)')
             ax5.legend(loc='upper left', fontsize=8)
             ax5.grid(True, alpha=0.3)
         
@@ -612,7 +642,8 @@ def analyze_multiple_factors(factors_data: Dict[str, pd.DataFrame],
                            n_groups: int = 10, 
                            method: str = 'spearman',
                            rebalance_period: int = 1,
-                           save_path: Optional[str] = None) -> Dict:
+                           save_path: Optional[str] = None,
+                           show_log_returns: bool = True) -> Dict:
     """
     多因子分析主函数
     
@@ -623,9 +654,10 @@ def analyze_multiple_factors(factors_data: Dict[str, pd.DataFrame],
         method: IC计算方法 ('spearman' 或 'pearson')
         rebalance_period: 调仓周期
         save_path: 图表保存路径
+        show_log_returns: 是否绘制对数收益的分箱图，默认为True
         
     Returns:
         包含所有分析结果的字典
     """
     analyzer = MultiFactorAnalyzer(factors_data, returns_data, rebalance_period)
-    return analyzer.generate_comprehensive_report(n_groups, method, save_path)
+    return analyzer.generate_comprehensive_report(n_groups, method, save_path, show_log_returns)

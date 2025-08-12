@@ -1,6 +1,10 @@
 # 结果展示
 
 本项目包含完整的测试结果和分析报告，所有相关图表和数据文件均保存在 `多因子框架/测试结果/` 目录下，便于复现与查阅。
+## 🎯 单因子测试结果
+- **STR因子分析**：[str_full_analysis.png](多因子框架/测试结果/str/str_full_analysis.png)
+- **小市值因子分析**：[str_full_analysis.png](多因子框架/测试结果/size/size_full_analysis.png)
+- **复合因子分析**：[multivariate_rolling_120_复合因子_full_analysis.png](多因子框架/测试结果/multivariate_rolling_120_复合因子/multivariate_rolling_120_复合因子_full_analysis.png)
 
 ## 📈 多因子集中测试结果
 - **多因子性能对比汇总**：[多因子集中测试_分析结果.png](多因子框架/测试结果/多因子集中测试结果/多因子集中测试_分析结果.png)
@@ -8,9 +12,7 @@
 - **多因子IC序列**：[多因子IC序列.csv](多因子框架/测试结果/多因子集中测试结果/多因子IC序列.csv)
 - **多因子累计IC序列**：[多因子累计IC序列.csv](多因子框架/测试结果/多因子集中测试结果/多因子累计IC序列.csv)
 
-## 🎯 单因子测试结果
-- **STR因子分析**：[str_full_analysis.png](多因子框架/测试结果/str/str_full_analysis.png)
-- **复合因子分析**：[multivariate_rolling_120_复合因子_full_analysis.png](多因子框架/测试结果/multivariate_rolling_120_复合因子/multivariate_rolling_120_复合因子_full_analysis.png)
+
 
 ## 📊 详细数据文件
 - **各因子分组收益率**：包含beta、book_to_price、earnings_yield、growth、leverage、liquidity、momentum、residual_volatility、size、str等因子的详细回测数据
