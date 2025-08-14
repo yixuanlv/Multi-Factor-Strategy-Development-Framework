@@ -76,7 +76,7 @@ def rebalance(context, bar_dict):
     df_target = df_target[~df_target['order_book_id'].isin(out_stocks)]
 
     # 动态计算目标持仓股票数：当前未停牌未退市未ST股票的10%
-    valid_stock_num = len(df_target)
+    valid_stock_num = df[(df['close'].notnull()) & (df['suspended'] != True) & (df['ST'] != True)]['order_book_id'].count()
     context.stock_num = max(1, int(valid_stock_num * 0.1))  # 至少持有1只
 
     small_cap_stocks = df_target.sort_values('factor', ascending=False).head(context.stock_num)['order_book_id'].tolist()

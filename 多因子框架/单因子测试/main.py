@@ -2,7 +2,13 @@ import pandas as pd
 import numpy as np
 import pickle
 import os
-from single_factor_analysis import SingleFactorAnalyzer, analyze_single_factor
+import importlib.util
+import sys
+import single_factor_analysis
+
+
+SingleFactorAnalyzer = single_factor_analysis.SingleFactorAnalyzer
+analyze_single_factor = single_factor_analysis.analyze_single_factor
 work_dir = os.path.dirname(os.path.abspath(__file__))
 print(work_dir)
 def load_data(factor_name):
@@ -52,6 +58,13 @@ def prepare_data(data, factor_data):
         else:
             data_reset = data.copy()
     
+    # 添加必要的过滤标志列（如果不存在）
+    required_flags = ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended']
+    for flag in required_flags:
+        if flag not in data_reset.columns:
+            print(f"添加缺失的过滤标志列: {flag}")
+            data_reset[flag] = 0  # 默认值设为0（不过滤）
+    
     # 准备因子数据
     factor_reset = None
     if isinstance(factor_data.index, pd.MultiIndex):
@@ -73,89 +86,131 @@ def prepare_data(data, factor_data):
     print(f"数据准备完成")
     print(f"行情数据: {data_reset.shape}")
     print(f"因子数据: {factor_reset.shape}")
+    print(f"行情数据列名: {data_reset.columns.tolist()}")
     
     return data_reset, factor_reset
 
-def main(factor_name):
-    """主函数"""
+def run_single_factor_analysis(factor_name,rebalance_period):
+    """执行单因子分析并保存结果"""
     print("=" * 60)
     print(f"单因子分析 - {factor_name} 因子")
     print("=" * 60)
-    
     try:
         # 创建测试结果主文件夹
         test_results_dir = os.path.join(work_dir, "../测试结果")
         os.makedirs(test_results_dir, exist_ok=True)
-        
+
         # 为当前因子创建独立的子文件夹
         factor_results_dir = os.path.join(test_results_dir, factor_name)
         os.makedirs(factor_results_dir, exist_ok=True)
-        
+
         # 加载数据
         data, factor_data = load_data(factor_name)
-        
+
         # 准备数据
         returns_data, factor_data_ready = prepare_data(data, factor_data)
-        
+
         if returns_data is None or factor_data_ready is None:
             print("数据准备失败，请检查数据格式")
             return
-        
+
         # 显示数据基本信息
         print("\n数据基本信息:")
         print(f"时间范围: {returns_data['date'].min()} 到 {returns_data['date'].max()}")
         print(f"股票数量: {returns_data['order_book_id'].nunique()}")
         print(f"数据点数量: {len(returns_data)}")
-        
+
         # 进行单因子分析
         print("\n开始单因子分析...")
-        
+
         # 准备图片保存路径
         image_save_path = os.path.join(factor_results_dir, f"{factor_name}_full_analysis.png")
-        
+
         results = analyze_single_factor(
             factor_data=factor_data_ready,
             returns_data=returns_data,
             factor_name=factor_name,
             n_groups=10,
             method='spearman',
-            rebalance_period=1,
-            save_path=image_save_path
+            rebalance_period=rebalance_period,
+            save_path=image_save_path,
+            enable_stock_filter=True
         )
-        
+
         print("\n分析完成！")
-        
+
         # 保存结果到因子专用文件夹
         output_dir = factor_results_dir
-        
+
         # 保存IC统计
         ic_stats = results['ic_stats']
         ic_df = pd.DataFrame([ic_stats])
         ic_df.to_csv(os.path.join(output_dir, f"{factor_name}_ic_stats.csv"), index=False)
-        
+
         # 保存多空组合统计
-        ls_stats = results['long_short_stats']
-        ls_df = pd.DataFrame([ls_stats])
-        ls_df.to_csv(os.path.join(output_dir, f"{factor_name}_long_short_stats.csv"), index=False)
-        
-        # 保存分组收益率
+        long_short_stats = results['long_short_stats']
+        ls_stats_df = pd.DataFrame([long_short_stats])
+        ls_stats_df.to_csv(os.path.join(output_dir, f"{factor_name}_long_short_stats.csv"), index=False)
+
+        # 保存分组收益率时间序列
         group_returns = results['group_returns']['group_returns']
         group_returns.to_csv(os.path.join(output_dir, f"{factor_name}_group_returns.csv"))
-        
-        # 保存累计收益率
+
+        # 保存累计收益率时间序列
         cumulative_returns = results['cumulative_returns']
         cumulative_returns.to_csv(os.path.join(output_dir, f"{factor_name}_cumulative_returns.csv"))
+
+        # 保存多空组合收益率时间序列
+        long_short_returns = results['long_short_returns']['long_short_returns']
+        long_short_returns.to_csv(os.path.join(output_dir, f"{factor_name}_long_short_returns.csv"))
+
+        # 保存多空组合累计收益率时间序列
+        cumulative_ls_returns = results['long_short_returns']['cumulative_ls_returns']
+        cumulative_ls_returns.to_csv(os.path.join(output_dir, f"{factor_name}_cumulative_ls_returns.csv"))
+
+        # 打印结果摘要
+        print(f"\n=== {factor_name} 因子分析结果摘要 ===")
+        print(f"IC统计:")
+        print(f"  IC均值: {ic_stats['IC_mean']:.4f}")
+        print(f"  IC标准差: {ic_stats['IC_std']:.4f}")
+        print(f"  ICIR: {ic_stats['ICIR']:.4f}")
+        print(f"  IC正比例: {ic_stats['IC_positive_ratio']:.2%}")
+        print(f"  IC偏度: {ic_stats['IC_skew']:.4f}")
+        print(f"  IC峰度: {ic_stats['IC_kurtosis']:.4f}")
+        print(f"  t值: {ic_stats['IC_tvalue']:.4f}")
+        print(f"  p值: {ic_stats['IC_pvalue']:.4g}")
         
-        # 保存多空收益率
-        ls_returns = results['long_short_returns']['long_short_returns']
-        ls_returns.to_csv(os.path.join(output_dir, f"{factor_name}_long_short_returns.csv"))
-        
+        print(f"\n多空组合统计:")
+        print(f"  平均收益: {long_short_stats['mean_return']:.4f}")
+        print(f"  收益率标准差: {long_short_stats['std_return']:.4f}")
+        print(f"  夏普比率: {long_short_stats['sharpe_ratio']:.4f}")
+        print(f"  胜率: {long_short_stats['win_rate']:.2%}")
+        print(f"  最大回撤: {long_short_stats['max_drawdown']:.2%}")
+        print(f"  总收益: {long_short_stats['total_return']:.2%}")
+
         print(f"\n结果已保存到: {output_dir}")
-        
+
     except Exception as e:
         print(f"分析过程中出现错误: {str(e)}")
         import traceback
         traceback.print_exc()
 
+def main(factor_name,rebalance_period):
+    """主函数，支持批量分析所有因子"""
+    if factor_name is None:
+        print("未指定因子名，将对所有因子库中的pkl文件进行单因子分析。")
+        factor_dir = os.path.join(work_dir, "../因子库")
+        all_files = os.listdir(factor_dir)
+        factor_files = [f for f in all_files if f.endswith('.pkl')]
+        if not factor_files:
+            print("未找到任何pkl因子文件，请检查因子库目录。")
+            return
+        for f in factor_files:
+            factor_name_single = os.path.splitext(f)[0]
+            print(f"\n开始分析因子: {factor_name_single}")
+            run_single_factor_analysis(factor_name_single,rebalance_period)
+    else:
+        run_single_factor_analysis(factor_name,rebalance_period)
+
 if __name__ == "__main__":
-    main( factor_name='holding_ret_factor')
+    main(factor_name=None,rebalance_period = 1)

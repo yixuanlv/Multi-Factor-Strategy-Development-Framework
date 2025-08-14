@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 import warnings
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
@@ -17,11 +18,12 @@ class SingleFactorAnalyzer:
     输入：长格式数据框，包含date、order_book_id、factor_value、close列
     """
 
-    def __init__(self, factor_data, returns_data, factor_name='factor', rebalance_period=1):
+    def __init__(self, factor_data, returns_data, factor_name='factor', rebalance_period=1, enable_stock_filter=True):
         self.factor_data = factor_data
         self.returns_data = returns_data
         self.factor_name = factor_name
         self.rebalance_period = rebalance_period  # 调仓周期，默认为1（每期调仓）
+        self.enable_stock_filter = enable_stock_filter  # 是否启用股票过滤，默认为True
         self._align_data()
 
     def _align_data(self):
@@ -37,7 +39,7 @@ class SingleFactorAnalyzer:
         # 计算收益率
         returns_data = self.returns_data.copy()
         returns_data.sort_values(['order_book_id', 'date'], inplace=True)
-        returns_data['return'] = returns_data.groupby('order_book_id')['close'].pct_change().shift(-1)
+        returns_data['return'] = returns_data.groupby('order_book_id')['close'].pct_change()
         
         # 合并数据，包含所有需要的列
         merged_data = pd.merge(
@@ -65,6 +67,10 @@ class SingleFactorAnalyzer:
         过滤可交易的股票
         for_buy: True表示买入过滤，False表示卖出过滤
         """
+        # 如果禁用股票过滤，直接返回原始数据
+        if not self.enable_stock_filter:
+            return data
+            
         filtered_data = data.copy()
         
         # 检查是否存在相关列
@@ -134,7 +140,8 @@ class SingleFactorAnalyzer:
             else:
                 return stats.pearsonr(x, y)[0]
 
-        # 使用groupby计算IC
+        # 使用groupby计算IC，添加进度条
+        print("正在计算每日IC值...")
         ic_series = merged_data.groupby('date').apply(calculate_ic_for_date)
 
         return ic_series
@@ -676,6 +683,6 @@ class SingleFactorAnalyzer:
         }
 
 
-def analyze_single_factor(factor_data, returns_data, factor_name='factor', n_groups=10, method='spearman', rebalance_period=1, save_path=None, show_log_returns=True):
-    analyzer = SingleFactorAnalyzer(factor_data, returns_data, factor_name, rebalance_period)
+def analyze_single_factor(factor_data, returns_data, factor_name='factor', n_groups=10, method='spearman', rebalance_period=1, enable_stock_filter=True, save_path=None, show_log_returns=True):
+    analyzer = SingleFactorAnalyzer(factor_data, returns_data, factor_name, rebalance_period, enable_stock_filter)
     return analyzer.generate_report(n_groups, method, save_path, show_log_returns)
