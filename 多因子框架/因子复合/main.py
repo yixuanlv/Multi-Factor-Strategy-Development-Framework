@@ -23,5 +23,5 @@ if __name__ == "__main__":
     # main(factor_names=['beta', 'size', 'momentum'], N_values=[30, 60], M_values=[30, 60])
     # main(methods=['univariate', 'ic'])  # 只分析一元回归和IC加权方法
     # main(methods=['ranking'])  # 只分析排序加权方法
-    main(methods=['multivariate'])  # 只分析多元回归加权方法
+    main(factor_names=['dividend_yield_ttm_factor', 'size', 'volatility_20_factor'],methods=['multivariate'])  # 只分析多元回归加权方法
     #main()  # 使用默认参数，分析所有方法

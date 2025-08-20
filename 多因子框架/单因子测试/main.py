@@ -10,30 +10,37 @@ import single_factor_analysis
 SingleFactorAnalyzer = single_factor_analysis.SingleFactorAnalyzer
 analyze_single_factor = single_factor_analysis.analyze_single_factor
 work_dir = os.path.dirname(os.path.abspath(__file__))
-print(work_dir)
 def load_data(factor_name):
     """加载行情数据和因子数据"""
-    print("正在加载数据...")
+
     
     # 加载行情数据
     data_path = os.path.join(work_dir, "../行情数据库/data.pkl")
     with open(data_path, 'rb') as f:
         data = pickle.load(f)
-    print(f"行情数据加载完成，数据形状: {data.shape}")
-    print(f"行情数据列名: {data.columns.tolist()[:10]}")
+
     
     # 加载因子数据
     factor_path = os.path.join(work_dir, f"../因子库/{factor_name}.pkl")
     with open(factor_path, 'rb') as f:
         factor_data = pickle.load(f)
-    print(f"因子数据加载完成，数据形状: {factor_data.shape}")
-    print(f"因子数据列名: {factor_data.columns.tolist()[:10]}")
+
     
-    return data, factor_data
+    # 加载Barra因子数据
+    barra_path = os.path.join(work_dir, "../因子库/Barra因子/barra.pkl")
+    barra_data = None
+    try:
+        with open(barra_path, 'rb') as f:
+            barra_data = pickle.load(f)
+
+    except Exception as e:
+        pass
+    
+    return data, factor_data, barra_data
 
 def prepare_data(data, factor_data):
     """准备分析所需的数据格式"""
-    print("正在准备数据...")
+
     
     # 处理行情数据
     data_reset = None
@@ -46,10 +53,8 @@ def prepare_data(data, factor_data):
                 data_reset.columns = ['date', 'order_book_id', 'close']
             else:
                 # 需要进一步处理
-                print("数据格式需要调整，请检查数据结构")
                 return None, None
         else:
-            print("请检查行情数据格式，需要包含close列")
             return None, None
     else:
         # 数据已经有close列，检查是否需要重置索引
@@ -62,7 +67,7 @@ def prepare_data(data, factor_data):
     required_flags = ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended']
     for flag in required_flags:
         if flag not in data_reset.columns:
-            print(f"添加缺失的过滤标志列: {flag}")
+
             data_reset[flag] = 0  # 默认值设为0（不过滤）
     
     # 准备因子数据
@@ -73,24 +78,19 @@ def prepare_data(data, factor_data):
         if len(factor_reset.columns) == 3:
             factor_reset.columns = ['date', 'order_book_id', 'factor_value']
         else:
-            print("因子数据格式需要调整，请检查数据结构")
             return None, None
     elif isinstance(factor_data, pd.DataFrame) and not isinstance(factor_data.index, pd.MultiIndex):
         # 宽格式，行为日期，列为股票代码
         factor_reset = factor_data.stack().reset_index()
         factor_reset.columns = ['date', 'order_book_id', 'factor_value']
     else:
-        print("请检查因子数据格式")
         return None, None
     
-    print(f"数据准备完成")
-    print(f"行情数据: {data_reset.shape}")
-    print(f"因子数据: {factor_reset.shape}")
-    print(f"行情数据列名: {data_reset.columns.tolist()}")
+
     
     return data_reset, factor_reset
 
-def run_single_factor_analysis(factor_name,rebalance_period):
+def run_single_factor_analysis(factor_name,rebalance_period):  
     """执行单因子分析并保存结果"""
     print("=" * 60)
     print(f"单因子分析 - {factor_name} 因子")
@@ -105,7 +105,7 @@ def run_single_factor_analysis(factor_name,rebalance_period):
         os.makedirs(factor_results_dir, exist_ok=True)
 
         # 加载数据
-        data, factor_data = load_data(factor_name)
+        data, factor_data, barra_data = load_data(factor_name)
 
         # 准备数据
         returns_data, factor_data_ready = prepare_data(data, factor_data)
@@ -114,17 +114,10 @@ def run_single_factor_analysis(factor_name,rebalance_period):
             print("数据准备失败，请检查数据格式")
             return
 
-        # 显示数据基本信息
-        print("\n数据基本信息:")
-        print(f"时间范围: {returns_data['date'].min()} 到 {returns_data['date'].max()}")
-        print(f"股票数量: {returns_data['order_book_id'].nunique()}")
-        print(f"数据点数量: {len(returns_data)}")
 
-        # 进行单因子分析
-        print("\n开始单因子分析...")
 
         # 准备图片保存路径
-        image_save_path = os.path.join(factor_results_dir, f"{factor_name}_full_analysis.png")
+        image_save_path = os.path.join(factor_results_dir, f"{factor_name}_full_analysis.html")
 
         results = analyze_single_factor(
             factor_data=factor_data_ready,
@@ -134,10 +127,11 @@ def run_single_factor_analysis(factor_name,rebalance_period):
             method='spearman',
             rebalance_period=rebalance_period,
             save_path=image_save_path,
-            enable_stock_filter=True
+            enable_stock_filter=True,
+            barra_data=barra_data
         )
 
-        print("\n分析完成！")
+
 
         # 保存结果到因子专用文件夹
         output_dir = factor_results_dir
@@ -188,7 +182,7 @@ def run_single_factor_analysis(factor_name,rebalance_period):
         print(f"  最大回撤: {long_short_stats['max_drawdown']:.2%}")
         print(f"  总收益: {long_short_stats['total_return']:.2%}")
 
-        print(f"\n结果已保存到: {output_dir}")
+
 
     except Exception as e:
         print(f"分析过程中出现错误: {str(e)}")
@@ -198,19 +192,16 @@ def run_single_factor_analysis(factor_name,rebalance_period):
 def main(factor_name,rebalance_period):
     """主函数，支持批量分析所有因子"""
     if factor_name is None:
-        print("未指定因子名，将对所有因子库中的pkl文件进行单因子分析。")
         factor_dir = os.path.join(work_dir, "../因子库")
         all_files = os.listdir(factor_dir)
         factor_files = [f for f in all_files if f.endswith('.pkl')]
         if not factor_files:
-            print("未找到任何pkl因子文件，请检查因子库目录。")
             return
         for f in factor_files:
             factor_name_single = os.path.splitext(f)[0]
-            print(f"\n开始分析因子: {factor_name_single}")
             run_single_factor_analysis(factor_name_single,rebalance_period)
     else:
         run_single_factor_analysis(factor_name,rebalance_period)
 
 if __name__ == "__main__":
-    main(factor_name=None,rebalance_period = 1)
+    main(factor_name='residual_5day_all_factor',rebalance_period = 1)
