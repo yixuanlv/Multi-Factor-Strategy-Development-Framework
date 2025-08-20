@@ -84,13 +84,14 @@ class SingleFactorAnalyzer:
         
         return data[mask]
 
-    def calculate_ic(self, method='spearman'):
+    def calculate_ic(self, method='spearman', lag=1):
         """计算IC值"""
-        print(f"  计算IC值 ({method}相关系数)...")
+        if lag == 1:
+            print(f"  计算IC1-IC5值 ({method}相关系数)...")
         
         # 创建未来收益率列
         merged_data = self.merged_data.copy()
-        merged_data['future_return'] = merged_data.groupby('order_book_id')['return'].shift(-self.rebalance_period)
+        merged_data['future_return'] = merged_data.groupby('order_book_id')['return'].shift(-lag)
         
         # 过滤可交易股票
         if self.enable_stock_filter:
@@ -101,7 +102,8 @@ class SingleFactorAnalyzer:
             lambda x: self._calculate_correlation(x['factor_value'], x['future_return'], method)
         )
         
-        print(f"    IC计算完成，共 {len(ic_series.dropna())} 个有效值")
+        if lag == 5:
+            print(f"    IC1-IC5计算完成")
         return ic_series
 
     def _calculate_correlation(self, x, y, method='spearman'):
@@ -120,27 +122,35 @@ class SingleFactorAnalyzer:
 
     def calculate_icir(self, method='spearman'):
         """计算ICIR统计指标"""
-        ic_series = self.calculate_ic(method).dropna()
-        if len(ic_series) == 0:
-            return {
-                'IC_mean': np.nan, 'IC_std': np.nan, 'ICIR': np.nan,
-                'IC_positive_ratio': np.nan, 'IC_skew': np.nan, 'IC_kurtosis': np.nan,
-                'IC_tvalue': np.nan, 'IC_pvalue': np.nan, 'IC_series': ic_series
-            }
+        # 计算IC1到IC5的统计指标
+        ic_stats_all = {}
         
-        ic_mean = ic_series.mean()
-        ic_std = ic_series.std()
-        icir = ic_mean / ic_std if ic_std != 0 else np.nan
-        ic_positive_ratio = (ic_series > 0).mean()
-        ic_skew = stats.skew(ic_series)
-        ic_kurtosis = stats.kurtosis(ic_series, fisher=True)
-        t_stat, p_value = stats.ttest_1samp(ic_series, 0, nan_policy='omit')
+        for lag in range(1, 6):
+            ic_series = self.calculate_ic(method, lag).dropna()
+            if len(ic_series) == 0:
+                ic_stats_all[f'IC{lag}'] = {
+                    'IC_mean': np.nan, 'IC_std': np.nan, 'ICIR': np.nan,
+                    'IC_positive_ratio': np.nan, 'IC_skew': np.nan, 'IC_kurtosis': np.nan,
+                    'IC_tvalue': np.nan, 'IC_pvalue': np.nan, 'IC_series': ic_series
+                }
+            else:
+                ic_mean = ic_series.mean()
+                ic_std = ic_series.std()
+                icir = ic_mean / ic_std if ic_std != 0 else np.nan
+                ic_positive_ratio = (ic_series > 0).mean()
+                ic_skew = stats.skew(ic_series)
+                ic_kurtosis = stats.kurtosis(ic_series, fisher=True)
+                t_stat, p_value = stats.ttest_1samp(ic_series, 0, nan_policy='omit')
+                
+                ic_stats_all[f'IC{lag}'] = {
+                    'IC_mean': ic_mean, 'IC_std': ic_std, 'ICIR': icir,
+                    'IC_positive_ratio': ic_positive_ratio, 'IC_skew': ic_skew, 'IC_kurtosis': ic_kurtosis,
+                    'IC_tvalue': t_stat, 'IC_pvalue': p_value, 'IC_series': ic_series
+                }
         
-        return {
-            'IC_mean': ic_mean, 'IC_std': ic_std, 'ICIR': icir,
-            'IC_positive_ratio': ic_positive_ratio, 'IC_skew': ic_skew, 'IC_kurtosis': ic_kurtosis,
-            'IC_tvalue': t_stat, 'IC_pvalue': p_value, 'IC_series': ic_series
-        }
+        # 返回IC1的统计指标作为主要结果，同时包含所有IC的统计
+        ic_stats_all['IC_series'] = ic_stats_all['IC1']['IC_series']
+        return ic_stats_all
 
     def create_decile_groups(self, n_groups=10):
         """创建分组并计算收益率"""
@@ -254,9 +264,19 @@ class SingleFactorAnalyzer:
                 }
             }
         
-        # 多空组合收益率 = 最高分组收益率 - 最低分组收益率
-        long_group = n_groups - 1
-        short_group = 0
+        # 根据IC自动判断多空方向
+        # 先计算IC均值来判断因子方向
+        ic_series = self.calculate_ic()
+        ic_mean = ic_series.mean()
+        
+        if ic_mean < 0:
+            # IC为负，因子与收益负相关，多1空10
+            long_group = 0  # 最低分组
+            short_group = n_groups - 1  # 最高分组
+        else:
+            # IC为正，因子与收益正相关，多10空1
+            long_group = n_groups - 1  # 最高分组
+            short_group = 0  # 最低分组
         
         long_returns = group_returns[long_group] if long_group in group_returns.columns else pd.Series(dtype=float)
         short_returns = group_returns[short_group] if short_group in group_returns.columns else pd.Series(dtype=float)
@@ -425,20 +445,20 @@ class SingleFactorAnalyzer:
         short_exposure.index = pd.to_datetime(short_exposure.index)
         exposure_diff.index = pd.to_datetime(exposure_diff.index)
 
-        # 简化聚合方法
-        half_year_diff = exposure_diff.resample('6M').mean()
+        # 按季度聚合
+        quarter_diff = exposure_diff.resample('Q').mean()
         
         # 设置最小阈值，减少噪声
-        threshold = 0.001
-        half_year_diff = half_year_diff.where(half_year_diff.abs() >= threshold, 0)
+        threshold = 0.00001
+        quarter_diff = quarter_diff.where(quarter_diff.abs() >= threshold, 0)
 
-        print(f"    完成，共计算 {len(half_year_diff)} 个半年期")
+        print(f"    完成，共计算 {len(quarter_diff)} 个季度")
 
         return {
             'long_exposure': long_exposure,
             'short_exposure': short_exposure,
             'exposure_diff': exposure_diff,
-            'half_year_diff': half_year_diff,
+            'quarter_diff': quarter_diff,
             'industry_factors': industry_factors
         }
 
@@ -549,16 +569,17 @@ class SingleFactorAnalyzer:
             if barra_industry_exposure is None:
                 barra_industry_exposure = self.calculate_industry_exposure(n_groups)
 
-        # 准备文本信息
+        # 准备文本信息 - 使用IC1的统计信息
+        ic1_stats = ic_stats.get('IC1', {})
         ic_stats_text = (
-            f"IC均值: {ic_stats['IC_mean']:.4f}<br/>"
-            f"IC标准差: {ic_stats['IC_std']:.4f}<br/>"
-            f"ICIR: {ic_stats['ICIR']:.4f}<br/>"
-            f"IC正比例: {ic_stats['IC_positive_ratio']:.2%}<br/>"
-            f"IC偏度: {ic_stats['IC_skew']:.4f}<br/>"
-            f"IC峰度: {ic_stats['IC_kurtosis']:.4f}<br/>"
-            f"t值: {ic_stats['IC_tvalue']:.4f}<br/>"
-            f"p值: {ic_stats['IC_pvalue']:.4g}"
+            f"IC1均值: {ic1_stats.get('IC_mean', np.nan):.4f}<br/>"
+            f"IC1标准差: {ic1_stats.get('IC_std', np.nan):.4f}<br/>"
+            f"IC1IR: {ic1_stats.get('ICIR', np.nan):.4f}<br/>"
+            f"IC1正比例: {ic1_stats.get('IC_positive_ratio', np.nan):.2%}<br/>"
+            f"IC1偏度: {ic1_stats.get('IC_skew', np.nan):.4f}<br/>"
+            f"IC1峰度: {ic1_stats.get('IC_kurtosis', np.nan):.4f}<br/>"
+            f"IC1t值: {ic1_stats.get('IC_tvalue', np.nan):.4f}<br/>"
+            f"IC1p值: {ic1_stats.get('IC_pvalue', np.nan):.4g}"
         )
         
         stats_text = (
@@ -583,7 +604,8 @@ class SingleFactorAnalyzer:
         ic_chart = (
             Bar()
             .add_xaxis([d.strftime('%Y-%m') for d in ic_monthly_mean.index])
-            .add_yaxis("IC月度均值", ic_monthly_mean['ic'].round(4).tolist(), yaxis_index=0)
+            .add_yaxis("IC月度均值", ic_monthly_mean['ic'].round(4).tolist(), yaxis_index=0,
+                      label_opts=opts.LabelOpts(is_show=False))
             .extend_axis(
                 yaxis=opts.AxisOpts(
                     name="IC累计值",
@@ -601,7 +623,9 @@ class SingleFactorAnalyzer:
                 yaxis_opts=opts.AxisOpts(
                     name="IC月度均值",
                     is_scale=True,
-                    axislabel_opts=opts.LabelOpts(is_show=False)
+                    axislabel_opts=opts.LabelOpts(is_show=False),
+                    axisline_opts=opts.AxisLineOpts(is_show=False),
+                    axistick_opts=opts.AxisTickOpts(is_show=False)
                 ),
                 datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
                 legend_opts=opts.LegendOpts(pos_top="5%"),
@@ -612,7 +636,9 @@ class SingleFactorAnalyzer:
         ic_line = (
             Line()
             .add_xaxis([d.strftime('%Y-%m') for d in ic_cum.index])
-            .add_yaxis("IC累计值", ic_cum.round(4).tolist(), yaxis_index=1)
+            .add_yaxis("IC累计值", ic_cum.round(4).tolist(), yaxis_index=1,
+                      label_opts=opts.LabelOpts(is_show=False),
+                      symbol_size=0)
         )
         
         ic_chart.overlap(ic_line)
@@ -624,13 +650,17 @@ class SingleFactorAnalyzer:
                 if group in cumulative_returns.columns:
                     log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
                     group_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_returns.index])
-                    group_chart.add_yaxis(f"分组{group+1}", log_returns.round(4).tolist())
+                    group_chart.add_yaxis(f"分组{group+1}", log_returns.round(4).tolist(),
+                                       label_opts=opts.LabelOpts(is_show=False),
+                                       symbol_size=0)
             title = f"{self.factor_name} - 各分组累计对数收益率(log10)"
         else:
             for group in range(n_groups):
                 if group in cumulative_returns.columns:
                     group_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_returns.index])
-                    group_chart.add_yaxis(f"分组{group+1}", cumulative_returns[group].round(4).tolist())
+                    group_chart.add_yaxis(f"分组{group+1}", cumulative_returns[group].round(4).tolist(),
+                                       label_opts=opts.LabelOpts(is_show=False),
+                                       symbol_size=0)
             title = f"{self.factor_name} - 各分组累计收益率"
         
         group_chart.set_global_opts(
@@ -643,7 +673,9 @@ class SingleFactorAnalyzer:
                             yaxis_opts=opts.AxisOpts(
                     name="累计收益率",
                     is_scale=True,
-                    axislabel_opts=opts.LabelOpts(is_show=False)
+                    axislabel_opts=opts.LabelOpts(is_show=False),
+                    axisline_opts=opts.AxisLineOpts(is_show=False),
+                    axistick_opts=opts.AxisTickOpts(is_show=False)
                 ),
             datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
             legend_opts=opts.LegendOpts(pos_top="5%"),
@@ -654,7 +686,9 @@ class SingleFactorAnalyzer:
         ls_chart = (
             Line()
             .add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_ls_returns.index])
-            .add_yaxis("多空累计收益", cumulative_ls_returns.round(4).tolist(), yaxis_index=0)
+            .add_yaxis("多空累计收益", cumulative_ls_returns.round(4).tolist(), yaxis_index=0,
+                      label_opts=opts.LabelOpts(is_show=False),
+                      symbol_size=0)
             .extend_axis(
                 yaxis=opts.AxisOpts(
                     name="动态回撤",
@@ -673,7 +707,9 @@ class SingleFactorAnalyzer:
                 yaxis_opts=opts.AxisOpts(
                     name="累计收益",
                     is_scale=True,
-                    axislabel_opts=opts.LabelOpts(is_show=False)
+                    axislabel_opts=opts.LabelOpts(is_show=False),
+                    axisline_opts=opts.AxisLineOpts(is_show=False),
+                    axistick_opts=opts.AxisTickOpts(is_show=False)
                 ),
                 datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
                 legend_opts=opts.LegendOpts(pos_top="5%"),
@@ -692,7 +728,8 @@ class SingleFactorAnalyzer:
                     yaxis_index=1,
                     is_symbol_show=False,
                     linestyle_opts=opts.LineStyleOpts(width=0),
-                    itemstyle_opts=opts.ItemStyleOpts(color="rgba(128,128,128,0.3)")
+                    itemstyle_opts=opts.ItemStyleOpts(color="rgba(128,128,128,0.3)"),
+                    label_opts=opts.LabelOpts(is_show=False)
                 )
                 .set_series_opts(
                     areastyle_opts=opts.AreaStyleOpts(
@@ -707,7 +744,8 @@ class SingleFactorAnalyzer:
         group_bar = (
             Bar()
             .add_xaxis([f"分组{i+1}" for i in range(n_groups)])
-            .add_yaxis("累计收益率", group_cumulative_returns.round(4).tolist())
+            .add_yaxis("累计收益率", group_cumulative_returns.round(4).tolist(),
+                      label_opts=opts.LabelOpts(is_show=False))
             .set_global_opts(
                 title_opts=opts.TitleOpts(title=f"{self.factor_name} - 各分组累计收益率"),
                 xaxis_opts=opts.AxisOpts(
@@ -717,7 +755,9 @@ class SingleFactorAnalyzer:
                 yaxis_opts=opts.AxisOpts(
                     name="累计收益率",
                     is_scale=True,
-                    axislabel_opts=opts.LabelOpts(is_show=False)
+                    axislabel_opts=opts.LabelOpts(is_show=False),
+                    axisline_opts=opts.AxisLineOpts(is_show=False),
+                    axistick_opts=opts.AxisTickOpts(is_show=False)
                 ),
                 datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
                 legend_opts=opts.LegendOpts(pos_top="5%"),
@@ -727,20 +767,47 @@ class SingleFactorAnalyzer:
 
         # 5. IC统计信息表格
         from pyecharts.components import Table
+        
+        # 准备IC1到IC5的统计信息 - 5列表格
+        headers = ["指标", "IC1", "IC2", "IC3", "IC4", "IC5"]
+        ic_table_data = []
+        
+        # 定义指标行
+        metrics = [
+            ("IC均值", "IC_mean", ":.4f"),
+            ("IC标准差", "IC_std", ":.4f"),
+            ("ICIR", "ICIR", ":.4f"),
+            ("IC正比例", "IC_positive_ratio", ":.2%"),
+            ("IC偏度", "IC_skew", ":.4f"),
+            ("IC峰度", "IC_kurtosis", ":.4f"),
+            ("t值", "IC_tvalue", ":.4f"),
+            ("p值", "IC_pvalue", ":.4g")
+        ]
+        
+        for metric_name, metric_key, format_str in metrics:
+            row = [metric_name]
+            for lag in range(1, 6):
+                ic_key = f'IC{lag}'
+                if ic_key in ic_stats:
+                    value = ic_stats[ic_key].get(metric_key, np.nan)
+                    if not pd.isna(value):
+                        if format_str == ":.2%":
+                            row.append(f"{value:.2%}")
+                        elif format_str == ":.4g":
+                            row.append(f"{value:.4g}")
+                        else:
+                            row.append(f"{value:.4f}")
+                    else:
+                        row.append("NaN")
+                else:
+                    row.append("NaN")
+            ic_table_data.append(row)
+        
         ic_table = (
             Table()
-            .add(["指标", "数值"], [
-                ["IC均值", f"{ic_stats['IC_mean']:.4f}"],
-                ["IC标准差", f"{ic_stats['IC_std']:.4f}"],
-                ["ICIR", f"{ic_stats['ICIR']:.4f}"],
-                ["IC正比例", f"{ic_stats['IC_positive_ratio']:.2%}"],
-                ["IC偏度", f"{ic_stats['IC_skew']:.4f}"],
-                ["IC峰度", f"{ic_stats['IC_kurtosis']:.4f}"],
-                ["t值", f"{ic_stats['IC_tvalue']:.4f}"],
-                ["p值", f"{ic_stats['IC_pvalue']:.4g}"]
-            ])
+            .add(headers, ic_table_data)
             .set_global_opts(
-                title_opts=opts.TitleOpts(title=f"{self.factor_name} - IC统计信息", pos_left="center")
+                title_opts=opts.TitleOpts(title=f"{self.factor_name} - IC1到IC5统计信息", pos_left="center")
             )
         )
 
@@ -769,7 +836,9 @@ class SingleFactorAnalyzer:
             for factor in style_factors:
                 if factor in daily_corr.columns:
                     barra_style_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in daily_corr.index])
-                    barra_style_chart.add_yaxis(factor, daily_corr[factor].round(4).tolist())
+                    barra_style_chart.add_yaxis(factor, daily_corr[factor].round(4).tolist(),
+                                             label_opts=opts.LabelOpts(is_show=False),
+                                             symbol_size=0)
             
             barra_style_chart.set_global_opts(
                 title_opts=opts.TitleOpts(title=f"{self.factor_name} - 与Barra风格因子相关系数（日度）"),
@@ -783,7 +852,9 @@ class SingleFactorAnalyzer:
                     is_scale=True,
                     min_=-1,
                     max_=1,
-                    axislabel_opts=opts.LabelOpts(is_show=False)
+                    axislabel_opts=opts.LabelOpts(is_show=False),
+                    axisline_opts=opts.AxisLineOpts(is_show=False),
+                    axistick_opts=opts.AxisTickOpts(is_show=False)
                 ),
                 datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
                 legend_opts=opts.LegendOpts(pos_top="5%"),
@@ -801,46 +872,49 @@ class SingleFactorAnalyzer:
 
         # 8. 行业因子暴露比例热力图
         if barra_industry_exposure is not None:
-            half_year_diff = barra_industry_exposure['half_year_diff']
+            quarter_diff = barra_industry_exposure['quarter_diff']
             industry_factors = barra_industry_exposure['industry_factors']
             
-            if len(half_year_diff) > 0:
+            if len(quarter_diff) > 0:
                 # 准备热力图数据
                 heatmap_data = []
                 
                 # 正确处理行业因子热力图数据
                 try:
                     # 发现数据结构：时间(行) × 行业因子(列)
-                    print(f"      热力图数据形状: {half_year_diff.shape}")
-                    print(f"      时间（行索引）: {half_year_diff.index.tolist()[:3]}")
-                    print(f"      行业因子（列索引）: {half_year_diff.columns.tolist()[:3]}")
+                    print(f"      热力图数据形状: {quarter_diff.shape}")
+                    print(f"      时间（行索引）: {quarter_diff.index.tolist()[:3]}")
+                    print(f"      行业因子（列索引）: {quarter_diff.columns.tolist()[:3]}")
                     
                     # 正确的迭代：时间作为X轴，行业因子作为Y轴
-                    for i, time_period in enumerate(half_year_diff.index):  # 时间作为X轴
-                        for j, industry_factor in enumerate(half_year_diff.columns):  # 行业因子作为Y轴
+                    for i, time_period in enumerate(quarter_diff.index):  # 时间作为X轴
+                        for j, industry_factor in enumerate(quarter_diff.columns):  # 行业因子作为Y轴
                             try:
-                                value = half_year_diff.loc[time_period, industry_factor]
+                                value = quarter_diff.loc[time_period, industry_factor]
                                 if not pd.isna(value):
-                                    heatmap_data.append([i, j, round(float(value), 2)])
+                                    heatmap_data.append([i, j, round(float(value), 4)])
                             except Exception as e:
                                 print(f"        跳过数据点 [{time_period}, {industry_factor}]: {e}")
                                 continue
                     
                     if heatmap_data:
-                        # 格式化时间标签
+                        # 格式化时间标签 - 按季度显示
                         time_labels = []
-                        for idx in half_year_diff.index:
+                        for idx in quarter_diff.index:
                             if hasattr(idx, 'strftime'):
-                                time_labels.append(idx.strftime('%Y-%m'))
+                                # 显示季度格式：2023Q1, 2023Q2等
+                                year = idx.year
+                                quarter = (idx.month - 1) // 3 + 1
+                                time_labels.append(f"{year}Q{quarter}")
                             else:
                                 time_labels.append(str(idx))
                         
                         # 优化热力图精度和颜色映射
                         # 计算更精确的数值范围，避免0值过多
-                        abs_max = half_year_diff.abs().max().max()
+                        abs_max = quarter_diff.abs().max().max()
                         if abs_max > 0:
                             # 使用95分位数来设置范围，减少极值影响
-                            quantile_95 = half_year_diff.abs().quantile(0.95).max()
+                            quantile_95 = quarter_diff.abs().quantile(0.95).max()
                             color_range = min(abs_max, quantile_95 * 1.2)
                         else:
                             color_range = 0.01  # 避免全为0的情况
@@ -849,11 +923,12 @@ class SingleFactorAnalyzer:
                         industry_heatmap = (
                             HeatMap()
                             .add_xaxis(time_labels)
-                            .add_yaxis("行业因子", list(half_year_diff.columns), heatmap_data)
+                            .add_yaxis("行业因子", list(quarter_diff.columns), heatmap_data,
+                                     label_opts=opts.LabelOpts(is_show=False))
                             .set_global_opts(
-                                title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异（半年统计）"),
+                                title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异（季度统计）"),
                                 xaxis_opts=opts.AxisOpts(
-                                    name="时间（半年）",
+                                    name="时间（季度）",
                                     type_="category",
                                     axislabel_opts=opts.LabelOpts(rotate=45)
                                 ),
@@ -901,7 +976,7 @@ class SingleFactorAnalyzer:
                 from pyecharts.components import Table
                 industry_heatmap = (
                     Table()
-                    .add(["行业因子多空暴露差异"], [["无半年统计数据"]])
+                    .add(["行业因子多空暴露差异"], [["无季度统计数据"]])
                     .set_global_opts(
                         title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异")
                     )
@@ -941,12 +1016,16 @@ class SingleFactorAnalyzer:
         if save_path is None:
             save_path = f"{self.factor_name}_分析报告.html"
         
-        # 使用Page组件组合所有图表
+        # 使用Page组件组合所有图表 - 重新组织布局
         from pyecharts.charts import Page
         
         page = Page(layout=Page.SimplePageLayout)
-        page.add(ic_chart, group_chart, ls_chart, group_bar, ic_table, stats_table, 
-                barra_style_chart, industry_heatmap, annual_table)
+        
+        # 上方：2*2图表布局
+        page.add(ic_chart, group_chart, ls_chart, group_bar)
+        
+        # 下方：所有表格
+        page.add(ic_table, stats_table, barra_style_chart, industry_heatmap, annual_table)
         
         # 保存为HTML文件
         page.render(save_path)
@@ -968,14 +1047,21 @@ class SingleFactorAnalyzer:
         
         ic_stats = self.calculate_icir(method)
         print(f"\nIC分析结果 ({method}相关系数):")
-        print(f"IC均值: {ic_stats['IC_mean']:.4f}")
-        print(f"IC标准差: {ic_stats['IC_std']:.4f}")
-        print(f"ICIR: {ic_stats['ICIR']:.4f}")
-        print(f"IC正比例: {ic_stats['IC_positive_ratio']:.2%}")
-        print(f"IC偏度: {ic_stats['IC_skew']:.4f}")
-        print(f"IC峰度: {ic_stats['IC_kurtosis']:.4f}")
-        print(f"t值: {ic_stats['IC_tvalue']:.4f}")
-        print(f"p值: {ic_stats['IC_pvalue']:.4g}")
+        
+        # 显示IC1到IC5的统计信息
+        for lag in range(1, 6):
+            ic_key = f'IC{lag}'
+            if ic_key in ic_stats:
+                ic_data = ic_stats[ic_key]
+                print(f"\n{ic_key}:")
+                print(f"  IC均值: {ic_data['IC_mean']:.4f}")
+                print(f"  IC标准差: {ic_data['IC_std']:.4f}")
+                print(f"  ICIR: {ic_data['ICIR']:.4f}")
+                print(f"  IC正比例: {ic_data['IC_positive_ratio']:.2%}")
+                print(f"  IC偏度: {ic_data['IC_skew']:.4f}")
+                print(f"  IC峰度: {ic_data['IC_kurtosis']:.4f}")
+                print(f"  t值: {ic_data['IC_tvalue']:.4f}")
+                print(f"  p值: {ic_data['IC_pvalue']:.4g}")
 
         returns_data = self.calculate_returns(n_groups)
         long_short_data = returns_data['long_short_returns']
