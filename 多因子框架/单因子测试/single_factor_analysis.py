@@ -313,7 +313,7 @@ class SingleFactorAnalyzer:
         return drawdown.min()
 
     def calculate_barra_style_correlation(self):
-        """计算Barra风格因子相关性 (完全向量化版本)"""
+        """计算Barra风格因子相关性 (彻底向量化版本)"""
         if self.barra_data is None:
             return None
 
@@ -323,74 +323,55 @@ class SingleFactorAnalyzer:
         barra_columns = self.barra_data.columns.tolist()
         style_factors = [col for col in barra_columns if col not in ['date', 'order_book_id']][:11]
 
-        # 因子数据： (date × stock)
+        # 构造因子宽表 (T × N)
         factor_wide = self.factor_data.pivot(index='date', columns='order_book_id', values='factor_value')
 
-        # Barra数据：分别处理每个风格因子
-        barra_wide = {}
-        for factor in style_factors:
-            barra_wide[factor] = self.barra_data.pivot(index='date', columns='order_book_id', values=factor)
+        # 构造所有风格因子宽表，堆叠成 (T × N × K)
+        barra_wide_all = []
+        for f in style_factors:
+            wide = self.barra_data.pivot(index='date', columns='order_book_id', values=f)
+            barra_wide_all.append(wide)
+        barra_wide_all = np.stack([df.reindex_like(factor_wide).to_numpy() for df in barra_wide_all], axis=-1)
 
-        # 共同日期 - 使用第一个风格因子的日期作为参考
-        if len(barra_wide) > 0:
-            first_factor = list(barra_wide.keys())[0]
-            barra_dates = barra_wide[first_factor].index
-            common_dates = factor_wide.index.intersection(barra_dates)
-        else:
-            common_dates = factor_wide.index
-        
-        if len(common_dates) == 0:
-            return None
+        # 对齐
+        common_dates = factor_wide.index
+        X = factor_wide.to_numpy()                  # (T × N)
+        Y = barra_wide_all                          # (T × N × K)
+        T, N = X.shape
+        K = Y.shape[2]
 
-        factor_wide = factor_wide.loc[common_dates]
-        
-        print(f"      处理 {len(style_factors)} 个风格因子，{len(common_dates)} 个日期...")
+        print(f"      处理 {K} 个风格因子，{T} 个日期...")
 
-        # --- 简化计算 ---
-        print(f"      开始计算相关性...")
-        corr_matrix = []
-        
-        for i, factor in enumerate(style_factors):
-            print(f"        处理因子 {i+1}/{len(style_factors)}: {factor}")
-            
-            if factor in barra_wide:
-                barra_mat = barra_wide[factor].loc[common_dates]
-                
-                # 计算全部交易日的相关性
-                sample_dates = common_dates
-                factor_sample = factor_wide.loc[sample_dates]
-                barra_sample = barra_mat.loc[sample_dates]
-                
-                # 计算相关性
-                correlations = []
-                for date in sample_dates:
-                    factor_vals = factor_sample.loc[date].dropna()
-                    barra_vals = barra_sample.loc[date].dropna()
-                    
-                    # 找到共同的股票
-                    common_stocks = factor_vals.index.intersection(barra_vals.index)
-                    if len(common_stocks) >= 10:
-                        try:
-                            corr = factor_vals.loc[common_stocks].corr(barra_vals.loc[common_stocks])
-                            correlations.append(corr if not pd.isna(corr) else np.nan)
-                        except:
-                            correlations.append(np.nan)
-                    else:
-                        correlations.append(np.nan)
-                
-                # 创建Series
-                corr_series = pd.Series(correlations, index=sample_dates)
-                corr_matrix.append(corr_series)
-            else:
-                # 如果因子不存在，创建全NaN的Series
-                corr_matrix.append(pd.Series([np.nan] * len(common_dates), index=common_dates))
-        
-        print(f"      相关性计算完成，开始拼接结果...")
-        
-        # 拼接结果
-        corr_df = pd.concat(corr_matrix, axis=1)
-        corr_df.columns = style_factors
+        # mask (有效值位置)
+        mask_x = ~np.isnan(X)                       # (T × N)
+        mask_y = ~np.isnan(Y)                       # (T × N × K)
+        mask = mask_x[:, :, None] & mask_y          # (T × N × K)
 
+        # 中心化
+        Xc = np.where(mask, X[:, :, None], np.nan)  # (T × N × K)
+        Yc = np.where(mask, Y, np.nan)
+
+        mean_x = np.nanmean(Xc, axis=1, keepdims=True)   # (T × 1 × K)
+        mean_y = np.nanmean(Yc, axis=1, keepdims=True)   # (T × 1 × K)
+
+        Xc = Xc - mean_x
+        Yc = Yc - mean_y
+
+        # 协方差与方差
+        cov = np.nansum(Xc * Yc, axis=1)                # (T × K)
+        var_x = np.nansum(Xc**2, axis=1)                # (T × K)
+        var_y = np.nansum(Yc**2, axis=1)                # (T × K)
+
+        corr = cov / np.sqrt(var_x * var_y)             # (T × K)
+
+        # 最小样本数过滤 (例如>=10只股票)
+        valid_counts = np.sum(mask, axis=1)             # (T × K)
+        corr[valid_counts < 10] = np.nan
+
+        # 转换为 DataFrame
+        corr_df = pd.DataFrame(corr, index=common_dates, columns=style_factors)
+
+        # rolling 计算
         rolling_corr = corr_df.rolling(window=20, min_periods=5).mean()
 
         print(f"    完成，共计算 {len(corr_df)} 个交易日")
@@ -1021,11 +1002,14 @@ class SingleFactorAnalyzer:
         
         page = Page(layout=Page.SimplePageLayout)
         
-        # 上方：2*2图表布局
+        # 第一行：2*2图表布局
         page.add(ic_chart, group_chart, ls_chart, group_bar)
         
-        # 下方：所有表格
-        page.add(ic_table, stats_table, barra_style_chart, industry_heatmap, annual_table)
+        # 第二行：行业暴露热力图和风格因子相关系数时序图
+        page.add(barra_style_chart, industry_heatmap)
+        
+        # 第三行：所有数据表
+        page.add(ic_table, stats_table, annual_table)
         
         # 保存为HTML文件
         page.render(save_path)
