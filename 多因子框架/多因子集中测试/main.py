@@ -3,6 +3,7 @@ import numpy as np
 import pickle
 import os
 from multi_factor_analysis import MultiFactorAnalyzer, analyze_multiple_factors
+from numpy_compat import safe_pickle_load
 
 work_dir = os.path.dirname(os.path.abspath(__file__))
 print(work_dir)
@@ -13,21 +14,26 @@ def load_data(factor_names):
     
     # 加载行情数据
     data_path = os.path.join(work_dir, "../行情数据库/data.pkl")
-    with open(data_path, 'rb') as f:
-        data = pickle.load(f)
-    print(f"行情数据加载完成，数据形状: {data.shape}")
+    try:
+        data = safe_pickle_load(data_path)
+        print(f"行情数据加载完成，数据形状: {data.shape}")
+    except Exception as e:
+        print(f"无法加载行情数据: {e}")
+        raise
     
     # 加载多个因子数据
     factors_data = {}
     for factor_name in factor_names:
         factor_path = os.path.join(work_dir, f"../因子库/{factor_name}.pkl")
         try:
-            with open(factor_path, 'rb') as f:
-                factor_data = pickle.load(f)
+            factor_data = safe_pickle_load(factor_path)
             factors_data[factor_name] = factor_data
             print(f"因子 {factor_name} 数据加载完成，数据形状: {factor_data.shape}")
         except FileNotFoundError:
             print(f"警告：因子 {factor_name} 数据文件不存在，跳过")
+            continue
+        except Exception as e:
+            print(f"警告：因子 {factor_name} 数据加载失败: {e}")
             continue
     
     if not factors_data:
@@ -91,11 +97,22 @@ def prepare_data(data, factors_data):
 def main(factor_names=None):
     """主函数"""
     if factor_names is None:
-        # 默认分析所有可用因子
-        factor_names = ['beta', 'book_to_price', 'earnings_yield', 
-                       'growth', 'leverage', 'liquidity', 'momentum', 
-                       'residual_volatility', 'size', 'str', 'multivariate_rolling_120_复合因子']
-    
+        # 自动读取指定目录下所有pkl后缀且大小在50MB~500MB之间的文件名作为因子名
+        import os
+        factor_dir = r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\多因子框架\因子库"
+        factor_names = []
+        for fname in os.listdir(factor_dir):
+            if fname.endswith('.pkl'):
+                fpath = os.path.join(factor_dir, fname)
+                try:
+                    fsize = os.path.getsize(fpath)
+                    if 50 * 1024 * 1024 < fsize < 500 * 1024 * 1024:
+                        factor_names.append(os.path.splitext(fname)[0])
+                except Exception as e:
+                    print(f"文件 {fname} 读取大小出错: {e}")
+        if not factor_names:
+            print("未找到符合条件的因子文件")
+            return
     print("=" * 60)
     print(f"多因子集中测试分析")
     print(f"分析因子: {', '.join(factor_names)}")
@@ -124,7 +141,7 @@ def main(factor_names=None):
         # 所有输出文件都放在 测试结果/多因子集中测试结果 目录下
         output_dir = os.path.join(work_dir, "../测试结果/多因子集中测试结果")
         os.makedirs(output_dir, exist_ok=True)
-        image_save_path = os.path.join(output_dir, "多因子集中测试_分析结果.png")
+        html_save_path = os.path.join(output_dir, "多因子集中测试_分析结果.html")
         
         results = analyze_multiple_factors(
             factors_data=factors_data_ready,
@@ -132,7 +149,7 @@ def main(factor_names=None):
             n_groups=10,
             method='spearman',
             rebalance_period=1,
-            save_path=image_save_path
+            save_path=html_save_path
         )
         
         print("\n多因子分析完成！")
@@ -194,7 +211,7 @@ def main(factor_names=None):
         performance_df.to_csv(f"{output_dir}/多因子性能对比汇总.csv", index=False)
         
         print(f"\n结果已保存到: {output_dir}")
-        print(f"图表已保存到: {image_save_path}")
+        print(f"HTML图表已保存到: {html_save_path}")
         
         # 打印简要总结
         print("\n" + "="*60)

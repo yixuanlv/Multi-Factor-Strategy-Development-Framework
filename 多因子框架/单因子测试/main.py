@@ -211,4 +211,4 @@ def main(factor_name,rebalance_period):
         run_single_factor_analysis(factor_name,rebalance_period)
 
 if __name__ == "__main__":
-    main(factor_name='str',rebalance_period = 1)
+    main(factor_name='residual_5day_all_factor',rebalance_period = 1)

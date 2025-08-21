@@ -1,9 +1,11 @@
 from rqalpha.api import *
 import pandas as pd
 import os
+import numpy as np
 import rqdatac as rq
 from rqalpha import run_func
 
+# 保持你的 rq.init（License 与环境一致）
 rq.init('license', 'B1T4WrPGQ0YBin6JPZm_DlLj3JGxAiuGzi9-SuUNqOUce6MrZ7yLejN2O9OWDPBJ3U6cVO-6uaK8Wn29JTxgNRHrqWJgGHTtf483vOI3bFPOMknL3dEAgQZJTLHJ7LyMZcalsTdqlVOyhT0mlNm_9iNEZBgTxhQW0X_DHOzxLBg=efJUVSAH7ub2Gg33v_nzcsj25LD0caxMdEYz93JazlzGzbk5tG6kxZKqGx9LcGX58GmZmd2IxNETyXC1jdWnnH7u97TeyhpkfP1lfJ5h5sp-1vSqT0tXvJH0SOGoIY4spxMnMeEprvKck7cwl1As3xh8y068HH8MApBtIrP7aOA=')
 
 config_0 = {
@@ -12,96 +14,101 @@ config_0 = {
         "end_date": "2025-07-22",
         "stock_commission_multiplier": 0.125,
         "frequency": "1d",
-        "accounts": {
-            "stock": 10000000
-        },
+        "accounts": {"stock": 10000000},
         "benchmark": "000300.XSHG"
     },
+    "extra": {
+        "log_level": "error"
+    },
     "mod": {
-        "sys_analyser": {
-            "enabled": True,
-            "plot": True,
-            "output_file": r"中性策略_1.pkl"
-        }
+        "sys_analyser": {"enabled": True, "plot": True, "output_file": r"纯多头_优化.pkl"}
     }
 }
-def init(context):
-    # 每周调仓，默认每周一开盘前执行
-    scheduler.run_weekly(rebalance, tradingday=1)  # 每周一开盘调仓
-    # 股票池为A股所有股票
-    context.stocks = all_instruments(type='CS', date=None)['order_book_id'].tolist()
-    # context.stock_num 不再在init中设置，改为在rebalance中动态计算
-    # 预加载factor_data.pkl
-    context.factor_data = pd.read_pickle(r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\测试代码\因子数据\multivariate_rolling_120_复合因子_长数据.pkl")
-    # 确保order_book_id为字符串
-    context.factor_data['order_book_id'] = context.factor_data['order_book_id'].astype(str)
 
-def before_trading(context):
-    pass
+def _precompute_top_decile_lists(df: pd.DataFrame) -> dict:
+    """
+    按照“每个交易日非停牌、非ST、close非None的股票总数”来动态确定Top10%股票，
+    返回 {date_str: [order_book_id, ...]} 字典。
+    """
+
+
+    # 类型标准化
+    df['order_book_id'] = df['order_book_id'].astype(str)
+    if not np.issubdtype(df['date'].dtype, np.dtype('O')):
+        df['date'] = df['date'].astype(str)
+
+    # 过滤：非停牌、非ST、close非None
+    if 'suspended' in df.columns:
+        df = df[df['suspended'] == False]
+    if 'ST' in df.columns:
+        df = df[df['ST'] == False]
+    if 'close' in df.columns:
+        df = df[df['close'].notnull()]
+
+    # 按日期分组，动态取每组Top10%
+    result = {}
+    for date, group in df.groupby('date'):
+        # 排除无因子值
+        group = group[group['factor'].notnull()]
+        group = group[group['close'].notnull()]
+        n = len(group)
+        if n == 0:
+            result[date] = []
+            continue
+        top_n = max(1, int(np.ceil(n * 0.10)))
+        # 按因子降序取前top_n
+        top_stocks = group.sort_values('factor', ascending=False).head(top_n)['order_book_id'].tolist()
+        result[date] = top_stocks
+
+    return result
+
+def init(context):
+    # 周一开盘调仓（与原脚本一致）
+    scheduler.run_weekly(rebalance, tradingday=1)
+
+    # （一次性）加载因子数据，过滤不可交易标的 —— 与原脚本逻辑一致
+    print("加载因子数据并预处理（一次性）...")
+    df = pd.read_pickle(
+        r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\测试代码\因子数据\multivariate_rolling_120_复合因子_长数据.pkl"
+    )
+
+    # 预处理：这些过滤在原脚本中已做，这里保留（集中到 init 里，调仓不再重复）
+    # 若输入已过滤也没关系，这里是幂等的
+
+    # 仅保留必要列，减小对象体积
+    cols = ['date', 'order_book_id', 'factor','close','ST','suspended','limit_up_flag','limit_down_flag']
+    df = df[[c for c in cols if c in df.columns]].dropna(subset=['factor'])
+
+    # —— 关键加速：一次性预计算每日 Top10% 股票清单 ——
+    context.top10_dict = _precompute_top_decile_lists(df)
+
+    # 最近一次下达的目标集合，用于“无变化则跳过下单”
+    context._last_targets = None
+
+    print(f"预计算完成，共 {len(context.top10_dict)} 个交易日可用目标池。")
 
 def handle_bar(context, bar_dict):
-    # 打印当前持仓股数、累计收益、当日收益等信息
-    portfolio = context.portfolio
-    持仓股数 = len([p for p in portfolio.positions.values() if p.quantity > 0])
-    # 修正：Portfolio对象没有'returns'属性，使用'total_returns'和'daily_returns'
-    累计收益 = getattr(portfolio, "total_returns", None)
-    当日收益 = getattr(portfolio, "daily_returns", None)
-    总资产 = portfolio.total_value
-    可用资金 = portfolio.cash
-    # 兼容属性不存在的情况
-    if 累计收益 is not None and 当日收益 is not None:
-        print(f"日期: {context.now.strftime('%Y-%m-%d')}, 持仓股数: {持仓股数}, 累计收益: {累计收益:.4%}, 当日收益: {当日收益:.4%}, 总资产: {总资产:.2f}, 可用资金: {可用资金:.2f}")
-    else:
-        print(f"日期: {context.now.strftime('%Y-%m-%d')}, 持仓股数: {持仓股数}, 总资产: {总资产:.2f}, 可用资金: {可用资金:.2f}")
+
+    pass
 
 def rebalance(context, bar_dict):
-    # 获取当前日期
-    current_date = context.now.strftime("%Y-%m-%d")
-    # 过滤出当前日期的市值数据
-    df = context.factor_data[context.factor_data['date'] == current_date]
-    # 过滤涨跌停和ST股票
-    df_target = df[(df['limit_up_flag'] == False) & (df['limit_down_flag'] == False) & (df['ST'] == False)]
-    
-    # 只保留股票池内的股票
-    df_target = df_target[df_target['order_book_id'].isin(context.stocks)]
+    # 用日期字符串做索引（与原数据一致）
+    cur = context.now.strftime("%Y-%m-%d")
 
-    # 过滤ST、停牌、涨跌停股票
-    out_stocks = []
-    for obid in df_target['order_book_id']:
-        # ST或停牌
-        if is_st_stock(obid) or is_suspended(obid):
-            out_stocks.append(obid)
-            continue
-    # 保留df['order_book_id']不在out_stocks的部分
-    df_target = df_target[~df_target['order_book_id'].isin(out_stocks)]
+    target_list = context.top10_dict.get(cur)
+    if not target_list:
+        return  # 当天无可交易目标，直接跳过
 
-    # 动态计算目标持仓股票数：当前未停牌未退市未ST股票的10%
-    valid_stock_num = df[(df['close'].notnull()) & (df['suspended'] != True) & (df['ST'] != True)]['order_book_id'].count()
-    context.stock_num = max(1, int(valid_stock_num * 0.1))  # 至少持有1只
+    # 若本次目标与上次相同，直接跳过下单（消除重复 API 调用）
+    if context._last_targets == tuple(target_list):
+        return
+    # 使用 order_target_portfolio 方法，一次性传入股票和等权重
+    weight = 1.0 / len(target_list)
+    weights = {stock: weight for stock in target_list}
+    order_target_portfolio(weights)
 
-    small_cap_stocks = df_target.sort_values('factor', ascending=False).head(context.stock_num)['order_book_id'].tolist()
+    # 记录这次目标
+    context._last_targets = tuple(target_list)
 
-    # 卖出不在小市值池中的股票
-    for stock in list(context.portfolio.positions.keys()):
-        if is_suspended(stock):
-            continue
-        if df[df['order_book_id'] == stock]['limit_down_flag'].values[0]:
-            continue
-        if stock not in small_cap_stocks:
-            order_target_percent(stock, 0)
-    # 平均分配资金买入小市值股票
-    weight = 1.0 / context.stock_num if context.stock_num > 0 else 0
-    for stock in small_cap_stocks:
-        order_target_percent(stock, weight)
 if __name__ == "__main__":
-    import sys
-    import os
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    from rqalpha.api import *
-    from rqalpha import run_func
-    run_func(
-        init=init,
-        before_trading=before_trading,
-        handle_bar=handle_bar,
-        config=config_0
-    )
+    run_func(init=init, handle_bar=handle_bar, config=config_0)

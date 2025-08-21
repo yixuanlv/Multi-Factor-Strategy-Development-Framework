@@ -1,7 +1,7 @@
 import pandas as pd
 
 # 读取回测结果
-result = pd.read_pickle(r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\测试代码\回测结果\测试策略_1(2).pkl")
+result = pd.read_pickle(r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\纯多头_优化版.pkl")
 
 # 如果result是字典，尝试提取其中的DataFrame
 if isinstance(result, dict):
