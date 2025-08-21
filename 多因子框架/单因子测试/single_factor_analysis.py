@@ -6,8 +6,7 @@ from scipy import stats
 import warnings
 from tqdm import tqdm
 from pyecharts import options as opts
-from pyecharts.charts import Line, Bar, Scatter, HeatMap
-from pyecharts.commons.utils import JsCode
+from pyecharts.charts import Line, Bar, HeatMap
 from pyecharts.globals import ThemeType
 
 warnings.filterwarnings('ignore')
@@ -16,426 +15,531 @@ warnings.filterwarnings('ignore')
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
+
 class SingleFactorAnalyzer:
     """
-    单因子分析工具类
-    输入：长格式数据框，包含date、order_book_id、factor_value、close列
+    单因子分析工具类（重构版）
+    输入：长格式数据框，包含 date, order_book_id, factor_value, close 列
+    - returns_data: 至少包含 date, order_book_id, close；如有 limit_up_flag/limit_down_flag/ST/suspended 会用于过滤
+    - barra_data: （可选）包含 date, order_book_id + 11个风格因子 + 行业因子（列名放在一起也可）
     """
 
-    def __init__(self, factor_data, returns_data, factor_name='factor', rebalance_period=1, enable_stock_filter=True, barra_data=None):
+    # ============== 初始化与基础对齐 ==============
+    def __init__(self, factor_data, returns_data, factor_name='factor',
+                 rebalance_period=1, enable_stock_filter=True, barra_data=None):
         self.factor_data = factor_data
         self.returns_data = returns_data
         self.factor_name = factor_name
         self.rebalance_period = rebalance_period
-        self.enable_stock_filter = enable_stock_filter
-        self.barra_data = barra_data
-        
+        self.enable_stock_filter = bool(enable_stock_filter)
+        self.barra_data = barra_data.copy() if barra_data is not None else None
+        # 缓存IC统计结果，避免重复计算
+        self._ic_stats_cache = {}
+        print("  [初始化层] 读取因子数据与行情数据 ...")
         self._align_data()
         self._create_rebalance_dates()
 
     def _align_data(self):
-        """对齐因子数据和收盘价数据，并计算收益率"""
-        # 转换日期格式
+        """对齐因子数据与行情数据并计算日收益"""
         self.factor_data['date'] = pd.to_datetime(self.factor_data['date'])
         self.returns_data['date'] = pd.to_datetime(self.returns_data['date'])
 
-        # 计算收益率
-        returns_data = self.returns_data.copy()
-        returns_data['return'] = returns_data.groupby('order_book_id')['close'].pct_change()
-        
-        # 合并数据
-        merged_data = pd.merge(
+        ret = self.returns_data.sort_values(['order_book_id', 'date']).copy()
+        ret['return'] = ret.groupby('order_book_id')['close'].pct_change()
+
+        extra_cols = [c for c in ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended'] if c in ret.columns]
+        merged = pd.merge(
             self.factor_data[['date', 'order_book_id', 'factor_value']],
-            returns_data[['date', 'order_book_id', 'return', 'close'] + 
-                        [col for col in ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended'] 
-                         if col in returns_data.columns]],
+            ret[['date', 'order_book_id', 'return', 'close'] + extra_cols],
             on=['date', 'order_book_id'],
             how='inner'
-        ).dropna()
+        )
+        # 不在这里dropna，保留收益NaN（例如停牌日），在统计时自然跳过
+        self.merged_data = merged.sort_values(['date', 'order_book_id'])
 
-        self.merged_data = merged_data
-        
+        if self.barra_data is not None:
+            self.barra_data['date'] = pd.to_datetime(self.barra_data['date'])
+        print(f"  [初始化层] 合并因子数据与行情数据公共部分，共 {len(self.merged_data['date'].unique()):,} 日 ...")
+
     def _create_rebalance_dates(self):
         """创建调仓日序列"""
-        all_dates = sorted(self.merged_data['date'].unique())
-        self.rebalance_dates = all_dates[::self.rebalance_period] if self.rebalance_period > 1 else all_dates
-        
-    def _is_rebalance_date(self, date):
-        """判断是否为调仓日"""
-        return date in self.rebalance_dates
+        all_dates = np.sort(self.merged_data['date'].unique())
+        if len(all_dates) == 0:
+            self.rebalance_dates = []
+            return
+        if self.rebalance_period > 1:
+            self.rebalance_dates = list(all_dates[::self.rebalance_period])
+        else:
+            self.rebalance_dates = list(all_dates)
 
-    def _filter_stocks(self, data, for_buy=True):
-        """股票过滤函数"""
+    # ============== 交易层：持仓与收益向量化计算 ==============
+    def _filter_stocks_for_buy(self, df_on_day):
+        """买入过滤（非涨停、非ST、非停牌），向量化布尔筛选"""
         if not self.enable_stock_filter:
-            return data
-            
-        if for_buy:
-            # 买入过滤：涨停、ST、停牌
-            filter_cols = ['limit_up_flag', 'ST', 'suspended']
-        else:
-            # 卖出过滤：跌停、停牌
-            filter_cols = ['limit_down_flag', 'suspended']
-        
-        # 创建过滤掩码
-        mask = pd.Series(True, index=data.index)
-        for col in filter_cols:
-            if col in data.columns:
-                mask &= ~data[col].astype(bool)
-        
-        return data[mask]
+            return df_on_day
+        mask = pd.Series(True, index=df_on_day.index)
+        if 'limit_up_flag' in df_on_day.columns:
+            mask &= ~df_on_day['limit_up_flag'].astype(bool)
+        if 'ST' in df_on_day.columns:
+            mask &= ~df_on_day['ST'].astype(bool)
+        if 'suspended' in df_on_day.columns:
+            mask &= ~df_on_day['suspended'].astype(bool)
+        return df_on_day[mask]
 
-    def calculate_ic(self, method='spearman', lag=1):
-        """计算IC值"""
-        if lag == 1:
-            print(f"  计算IC1-IC5值 ({method}相关系数)...")
-        
-        # 创建未来收益率列
-        merged_data = self.merged_data.copy()
-        merged_data['future_return'] = merged_data.groupby('order_book_id')['return'].shift(-lag)
-        
-        # 过滤可交易股票
-        if self.enable_stock_filter:
-            merged_data = self._filter_stocks(merged_data, for_buy=True)
-        
-        # 按日期分组计算IC
-        ic_series = merged_data.groupby('date').apply(
-            lambda x: self._calculate_correlation(x['factor_value'], x['future_return'], method)
-        )
-        
-        if lag == 5:
-            print(f"    IC1-IC5计算完成")
-        return ic_series
+    def _make_groups_on_rebalance_day(self, df_day, n_groups):
+        """
+        单个调仓日：因子从小到大排序分组，返回列 ['rb_date','order_book_id','group']。
+        使用rank -> 等容量划分，避免qcut重复边界问题。
+        """
+        df = df_day.dropna(subset=['factor_value']).copy()
+        df = self._filter_stocks_for_buy(df)
+        if len(df) < n_groups:
+            return pd.DataFrame(columns=['rb_date', 'order_book_id', 'group'])
 
-    def _calculate_correlation(self, x, y, method='spearman'):
-        """计算相关系数"""
-        if len(x.dropna()) < 10:
-            return np.nan
-            
-        try:
-            if method.lower() == 'spearman':
-                correlation, _ = stats.spearmanr(x, y)
-            else:
-                correlation = np.corrcoef(x, y)[0, 1]
-            return correlation
-        except:
-            return np.nan
+        ranks = df['factor_value'].rank(method='first', ascending=True)
+        group_size = max(1, len(ranks) // n_groups)
+        groups = ((ranks - 1) // group_size).clip(upper=n_groups - 1).astype(int)
 
-    def calculate_icir(self, method='spearman'):
-        """计算ICIR统计指标"""
-        # 计算IC1到IC5的统计指标
-        ic_stats_all = {}
-        
-        for lag in range(1, 6):
-            ic_series = self.calculate_ic(method, lag).dropna()
-            if len(ic_series) == 0:
-                ic_stats_all[f'IC{lag}'] = {
-                    'IC_mean': np.nan, 'IC_std': np.nan, 'ICIR': np.nan,
-                    'IC_positive_ratio': np.nan, 'IC_skew': np.nan, 'IC_kurtosis': np.nan,
-                    'IC_tvalue': np.nan, 'IC_pvalue': np.nan, 'IC_series': ic_series
-                }
-            else:
-                ic_mean = ic_series.mean()
-                ic_std = ic_series.std()
-                icir = ic_mean / ic_std if ic_std != 0 else np.nan
-                ic_positive_ratio = (ic_series > 0).mean()
-                ic_skew = stats.skew(ic_series)
-                ic_kurtosis = stats.kurtosis(ic_series, fisher=True)
-                t_stat, p_value = stats.ttest_1samp(ic_series, 0, nan_policy='omit')
-                
-                ic_stats_all[f'IC{lag}'] = {
-                    'IC_mean': ic_mean, 'IC_std': ic_std, 'ICIR': icir,
-                    'IC_positive_ratio': ic_positive_ratio, 'IC_skew': ic_skew, 'IC_kurtosis': ic_kurtosis,
-                    'IC_tvalue': t_stat, 'IC_pvalue': p_value, 'IC_series': ic_series
-                }
-        
-        # 返回IC1的统计指标作为主要结果，同时包含所有IC的统计
-        ic_stats_all['IC_series'] = ic_stats_all['IC1']['IC_series']
-        return ic_stats_all
+        out = pd.DataFrame({
+            'rb_date': df_day['date'].iloc[0],
+            'order_book_id': df.loc[ranks.index, 'order_book_id'].values,
+            'group': groups.values
+        })
+        return out
 
-    def create_decile_groups(self, n_groups=10):
-        """创建分组并计算收益率"""
-        print(f"  创建 {n_groups} 分组...")
-        
-        # 只在调仓日创建分组
-        rebalance_dates_set = set(self.rebalance_dates)
-        merged_data_filtered = self.merged_data[self.merged_data['date'].isin(rebalance_dates_set)].copy()
-        
-        if len(merged_data_filtered) == 0:
-            empty_df = pd.DataFrame(columns=['date', 'order_book_id', 'group'])
-            empty_returns = pd.DataFrame(index=pd.DatetimeIndex([]), columns=range(n_groups))
-            return {'group_returns': empty_returns, 'group_labels': empty_df}
-        
-        # 过滤可交易股票
-        if self.enable_stock_filter:
-            merged_data_filtered = self._filter_stocks(merged_data_filtered, for_buy=True)
-        
-        # 创建分组
-        group_data_list = []
-        for date, group in merged_data_filtered.groupby('date'):
-            if len(group) >= n_groups:
-                factor = group['factor_value'].dropna()
-                if len(factor) >= n_groups:
-                    # 创建分组
-                    ranks = factor.rank(method='first', ascending=True)
-                    group_size = len(ranks) // n_groups
-                    groups = (ranks - 1) // group_size
-                    groups = groups.clip(upper=n_groups-1)
-                    
-                    date_groups = pd.DataFrame({
-                        'date': date,
-                        'order_book_id': group.loc[factor.index, 'order_book_id'].values,
-                        'group': groups.values
-                    })
-                    group_data_list.append(date_groups)
-        
-        if not group_data_list:
-            empty_df = pd.DataFrame(columns=['date', 'order_book_id', 'group'])
-            empty_returns = pd.DataFrame(index=pd.DatetimeIndex([]), columns=range(n_groups))
-            return {'group_returns': empty_returns, 'group_labels': empty_df}
-        
-        # 合并所有分组数据
-        group_df = pd.concat(group_data_list, ignore_index=True)
-        
-        # 计算未来收益率
-        print(f"    计算未来收益率...")
-        stock_ids = group_df['order_book_id'].unique()
-        merged_data_subset = self.merged_data[self.merged_data['order_book_id'].isin(stock_ids)].copy()
-        merged_data_subset['future_return'] = merged_data_subset.groupby('order_book_id')['return'].shift(-self.rebalance_period)
-        
-        # 合并分组和收益率
-        merged_with_groups = pd.merge(
-            group_df,
-            merged_data_subset[['date', 'order_book_id', 'future_return']],
-            on=['date', 'order_book_id'],
-            how='left'
-        )
-        
-        # 计算分组收益率
-        group_returns = merged_with_groups.groupby(['date', 'group'])['future_return'].mean().unstack(fill_value=np.nan)
-        
-        # 处理最后几天的NaN值
-        valid_dates = group_returns.dropna(how='all').index
-        if len(valid_dates) > 0:
-            group_returns = group_returns.loc[valid_dates]
-        
-        # 确保所有分组都存在
-        for g in range(n_groups):
-            if g not in group_returns.columns:
-                group_returns[g] = np.nan
-        group_returns = group_returns.reindex(columns=range(n_groups))
-
-        print(f"    分组创建完成，共 {len(group_returns)} 个交易日")
-        return {'group_returns': group_returns, 'group_labels': group_df}
-
-    def calculate_returns(self, n_groups=10):
-        """计算收益率数据"""
-        group_data = self.create_decile_groups(n_groups)
-        group_returns = group_data['group_returns']
-        
-        # 计算累计收益率
-        group_returns_filled = group_returns.fillna(0)
-        cumulative_returns = (1 + group_returns_filled).cumprod()
-        
-        # 计算多空组合收益率
-        long_short_data = self._calculate_long_short_returns(n_groups, group_data)
-        
-        return {
-            'group_returns': group_data,
-            'cumulative_returns': cumulative_returns,
-            'long_short_returns': long_short_data
-        }
-    
-    def _calculate_long_short_returns(self, n_groups=10, group_data=None):
-        """计算多空组合收益率"""
-        if group_data is None:
-            group_data = self.create_decile_groups(n_groups)
-        
-        group_returns = group_data['group_returns']
-        
-        if group_returns.empty:
-            return {
-                'long_short_returns': pd.Series(dtype=float),
-                'cumulative_ls_returns': pd.Series(dtype=float),
-                'long_returns': pd.Series(dtype=float),
-                'short_returns': pd.Series(dtype=float),
-                'stats': {
-                    'mean_return': np.nan, 'std_return': np.nan, 'sharpe_ratio': np.nan,
-                    'max_drawdown': np.nan, 'win_rate': np.nan, 'total_return': np.nan
-                }
+    def compute_positions_and_returns(self, n_groups=10):
+        """
+        交易层主函数：
+        1) 仅在调仓日做分组（非停牌/非ST/非涨停）
+        2) 利用 merge_asof 将“最近一次调仓结果”映射到每个交易日，形成每日持仓（非调仓日继承）
+        3) 与行情合并，计算每日各组等权收益；给出各组累计净值
+        返回：
+        {
+            'positions_daily': DataFrame[date, rb_date, order_book_id, group],
+            'group_daily_returns': DataFrame(index=date, columns=0..n_groups-1),
+            'group_cum_nav': DataFrame(index=date, columns=0..n_groups-1),
+            'rebalance_info': {
+                'rebalance_dates': list,
+                'group_labels_rebalance': DataFrame[rb_date, order_book_id, group]
             }
+        }
+        """
+        print(f"  [交易层] 构建调仓分组与每日持仓 (n_groups={n_groups}, 周期={self.rebalance_period}) ...")
+
+        if len(self.rebalance_dates) == 0:
+            empty = pd.DataFrame(columns=['date', 'rb_date', 'order_book_id', 'group'])
+            idx = pd.DatetimeIndex([])
+            grp = pd.DataFrame(index=idx, columns=range(n_groups))
+            return {
+                'positions_daily': empty,
+                'group_daily_returns': grp,
+                'group_cum_nav': grp,
+                'rebalance_info': {'rebalance_dates': [], 'group_labels_rebalance': empty}
+            }
+
+        # 仅在调仓日分组
+        md = self.merged_data.copy()
+
+        # 关键：将收益率shift(-1)，使得持有期收益为“买入当日持有到下一交易日”的收益
+        md = md.sort_values(['order_book_id', 'date'])
+        md['future_return'] = md.groupby('order_book_id')['return'].shift(-1)
+
+        rb_set = set(self.rebalance_dates)
+        df_rb = md[md['date'].isin(rb_set)].copy()
+
+        # 按调仓日分组，批量生成分组
+        group_labels_list = []
+        for d, g in df_rb.groupby('date'):
+            res = self._make_groups_on_rebalance_day(g, n_groups)
+            if len(res) > 0:
+                group_labels_list.append(res)
+
+        if not group_labels_list:
+            empty = pd.DataFrame(columns=['date', 'rb_date', 'order_book_id', 'group'])
+            idx = pd.DatetimeIndex([])
+            grp = pd.DataFrame(index=idx, columns=range(n_groups))
+            return {
+                'positions_daily': empty,
+                'group_daily_returns': grp,
+                'group_cum_nav': grp,
+                'rebalance_info': {'rebalance_dates': self.rebalance_dates, 'group_labels_rebalance': empty}
+            }
+
+        group_labels_rebalance = pd.concat(group_labels_list, ignore_index=True)
+
+        # 将每个交易日映射到“最近一次调仓日”
+        all_dates = np.sort(md['date'].unique())
+        dates_df = pd.DataFrame({'date': pd.to_datetime(all_dates)}).sort_values('date')
+        rb_df = pd.DataFrame({'rb_date': pd.to_datetime(self.rebalance_dates)}).sort_values('rb_date')
+
+        # merge_asof 找最近不超过 date 的 rb_date
+        map_df = pd.merge_asof(
+            dates_df.rename(columns={'date': 'key'}),
+            rb_df.rename(columns={'rb_date': 'key'}),
+            on='key', direction='backward'
+        ).rename(columns={'key': 'date', 'key_y': 'rb_date'}).drop(columns=['rb_date'], errors='ignore')
+
+        # 注意：上面的 asof 会把匹配的列名放回第2列，直接再合并一次获取 rb_date
+        map_df = pd.merge_asof(
+            dates_df, rb_df, left_on='date', right_on='rb_date', direction='backward'
+        )
+
+        # positions_daily = 对每个 date，拿到对应 rb_date 的分组
+        positions_daily = map_df.merge(
+            group_labels_rebalance, how='left', on='rb_date'
+        )[['date', 'rb_date', 'order_book_id', 'group']]
+
+        # 用 future_return 替换原有的 return，确保是“买入当日持有到下一交易日”的收益
+        pr = positions_daily.merge(
+            md[['date', 'order_book_id', 'future_return']],
+            on=['date', 'order_book_id'], how='left'
+        ).rename(columns={'future_return': 'return'})
+
+        # groupby mean（自动忽略NaN收益）
+        group_daily_returns = (
+            pr.groupby(['date', 'group'])['return']
+              .mean()
+              .unstack('group')
+              .reindex(columns=range(n_groups))
+              .sort_index()
+        )
+
+        # 累计净值（从1开始）
+        # 注意：这里使用的是日收益率，累计净值会增长很快
+        # 如果需要年化收益率，应该使用 (1 + daily_return).cumprod() ** (252/len(daily_return)) - 1
+        group_cum_nav = (1 + group_daily_returns.fillna(0)).cumprod()
+
+        print(f"  [交易层] 已生成每日持仓 {len(positions_daily):,} 行；交易日 {group_daily_returns.shape[0]} 天。")
+
+        return {
+            'positions_daily': positions_daily,
+            'group_daily_returns': group_daily_returns,
+            'group_cum_nav': group_cum_nav,
+            'rebalance_info': {
+                'rebalance_dates': self.rebalance_dates,
+                'group_labels_rebalance': group_labels_rebalance
+            }
+        }
+
+    # ============== 绩效层：IC/ICIR + 多空统计 ==============
+    def compute_ic_and_stats(self, method='spearman', max_lag=5):
+        """
+        将 IC / ICIR 等指标合并在一个函数内：
+        返回字典 { 'IC1': {...}, ..., 'IC{max_lag}': {...}, 'IC_series': Series(IC1) }
+        """
+        # 检查缓存中是否已有相同参数的结果
+        cache_key = (method, max_lag)
+        if cache_key in self._ic_stats_cache:
+            print(f"  [绩效层] 使用缓存的 IC/ICIR 结果（method={method}, lag=1..{max_lag}） ...")
+            return self._ic_stats_cache[cache_key]
+            
+        print(f"  [绩效层] 计算 IC/ICIR（method={method}, lag=1..{max_lag}） ...")
+        md = self.merged_data.copy()
+
+        def _corr(a, b):
+            a = a.astype(float); b = b.astype(float)
+            if a.notna().sum() < 10 or b.notna().sum() < 10:
+                return np.nan
+            if method.lower() == 'spearman':
+                c, _ = stats.spearmanr(a, b, nan_policy='omit')
+                return c
+            else:
+                return np.corrcoef(a.dropna(), b.loc[a.dropna().index].dropna())[0, 1]
+
+        out = {}
+        for lag in range(1, max_lag + 1):
+            tmp = md.copy()
+            # 计算从当日收盘价到未来第lag*rebalance_period个交易日的收益率
+            actual_days = lag + self.rebalance_period - 1
+            tmp['future_close'] = tmp.groupby('order_book_id')['close'].shift(-actual_days)
+            tmp['future_return'] = (tmp['future_close'] - tmp['close']) / tmp['close']
+
+            # IC计算也需要买入过滤：去除停牌、ST、涨停等不可交易的股票
+            if self.enable_stock_filter:
+                tmp = self._filter_stocks_for_buy(tmp)
+            
+            ic_series = (
+                tmp.groupby('date')
+                   .apply(lambda g: _corr(g['factor_value'], g['future_return']))
+                   .astype(float)
+            )
+
+            ic_s = ic_series.dropna()
+            if len(ic_s) == 0:
+                stats_pack = dict(IC_mean=np.nan, IC_std=np.nan, ICIR=np.nan,
+                                  IC_positive_ratio=np.nan, IC_skew=np.nan, IC_kurtosis=np.nan,
+                                  IC_tvalue=np.nan, IC_pvalue=np.nan, IC_series=ic_series)
+            else:
+                ic_mean = ic_s.mean()
+                ic_std = ic_s.std()
+                icir = ic_mean / ic_std if ic_std != 0 else np.nan
+                ic_pos = (ic_s > 0).mean()
+                ic_skew = stats.skew(ic_s)
+                ic_kurt = stats.kurtosis(ic_s, fisher=True)
+                t_stat, p_val = stats.ttest_1samp(ic_s, 0, nan_policy='omit')
+                stats_pack = dict(IC_mean=ic_mean, IC_std=ic_std, ICIR=icir,
+                                  IC_positive_ratio=ic_pos, IC_skew=ic_skew, IC_kurtosis=ic_kurt,
+                                  IC_tvalue=t_stat, IC_pvalue=p_val, IC_series=ic_series)
+            
+            # 使用实际预测天数作为IC的键名，使其更直观
+            ic_key = f'IC{actual_days}D' if self.rebalance_period > 1 else f'IC{lag}'
+            out[ic_key] = stats_pack
+
+        # 设置默认的IC_series为第一个lag的结果
+        first_key = list(out.keys())[0]
+        out['IC_series'] = out[first_key]['IC_series']
+        print("    IC/ICIR 计算完成。")
         
-        # 根据IC自动判断多空方向
-        # 先计算IC均值来判断因子方向
-        ic_series = self.calculate_ic()
-        ic_mean = ic_series.mean()
-        
-        if ic_mean < 0:
-            # IC为负，因子与收益负相关，多1空10
-            long_group = 0  # 最低分组
-            short_group = n_groups - 1  # 最高分组
+        # 将结果存入缓存
+        self._ic_stats_cache[cache_key] = out
+        return out
+
+    def _annual_stats_df(self, ic_series, long_returns, short_returns, long_short_returns):
+        """年度统计表"""
+        # 对齐索引
+        for s in [ic_series, long_returns, short_returns, long_short_returns]:
+            if not isinstance(s.index, pd.DatetimeIndex):
+                s.index = pd.to_datetime(s.index)
+
+        common = ic_series.index.intersection(long_returns.index)\
+                                 .intersection(short_returns.index)\
+                                 .intersection(long_short_returns.index)
+        ic_series = ic_series.reindex(common)
+        long_returns = long_returns.reindex(common)
+        short_returns = short_returns.reindex(common)
+        ls_ret = long_short_returns.reindex(common)
+
+        years = sorted(ic_series.index.year.unique())
+        rows = []
+        for y in years:
+            mask = ic_series.index.year == y
+            ic_mean = ic_series[mask].mean()
+            long_y = long_returns[mask]
+            short_y = short_returns[mask]
+            ls_y = ls_ret[mask]
+
+            long_ann = (1 + long_y).prod() - 1 if long_y.notna().sum() else np.nan
+            short_ann = (1 + short_y).prod() - 1 if short_y.notna().sum() else np.nan
+            sharpe = np.nan
+            if ls_y.notna().sum() > 1 and ls_y.std() not in [0, np.nan]:
+                sharpe = (ls_y.mean() / ls_y.std()) * np.sqrt(252)
+
+            cum = (1 + ls_y.fillna(0)).cumprod()
+            if len(cum) > 0:
+                running_max = cum.expanding().max()
+                dd = (cum - running_max) / running_max
+                max_dd = dd.min()
+            else:
+                max_dd = np.nan
+
+            rows.append({
+                '年度': str(y),
+                'IC均值': ic_mean,
+                '多头收益': long_ann * 100 if pd.notna(long_ann) else np.nan,
+                '空头收益': short_ann * 100 if pd.notna(short_ann) else np.nan,
+                '多空夏普': sharpe if pd.notna(sharpe) else np.nan,
+                '多空最大回撤': max_dd * 100 if pd.notna(max_dd) else np.nan
+            })
+        return pd.DataFrame(rows)
+
+    def analyze_performance(self, positions_returns, method='spearman', n_groups=10):
+        """
+        基于交易结果汇总绩效：IC/ICIR + long-short + 年度统计
+        返回：
+        {
+            'ic_stats': ...,
+            'long_short': {
+                'long_short_returns', 'cumulative_ls_returns',
+                'long_returns', 'short_returns', 'stats'
+            },
+            'annual_df': DataFrame
+        }
+        """
+        print("  [绩效层] 汇总绩效指标 ...")
+        grp_ret = positions_returns['group_daily_returns']
+
+        # 自动判断多空方向（基于IC均值）
+        ic_stats = self.compute_ic_and_stats(method=method, max_lag=5)
+        # 获取第一个IC统计结果（可能是IC1或IC{actual_days}D）
+        first_ic_key = [k for k in ic_stats.keys() if k != 'IC_series'][0]
+        ic_mean = ic_stats[first_ic_key]['IC_mean']
+        if pd.isna(ic_mean) or ic_mean >= 0:
+            long_group, short_group = n_groups - 1, 0  # 因子正相关：多高空低
         else:
-            # IC为正，因子与收益正相关，多10空1
-            long_group = n_groups - 1  # 最高分组
-            short_group = 0  # 最低分组
-        
-        long_returns = group_returns[long_group] if long_group in group_returns.columns else pd.Series(dtype=float)
-        short_returns = group_returns[short_group] if short_group in group_returns.columns else pd.Series(dtype=float)
+            long_group, short_group = 0, n_groups - 1  # 因子负相关：多低空高
+
+        long_returns = grp_ret.get(long_group, pd.Series(dtype=float))
+        short_returns = grp_ret.get(short_group, pd.Series(dtype=float))
+
         long_short_returns = long_returns - short_returns
-        
-        # 计算累计收益率
-        long_short_returns_filled = long_short_returns.fillna(0)
-        cumulative_ls_returns = (1 + long_short_returns_filled).cumprod()
-        
-        # 计算统计指标
-        ls_stats = {
+        # 多空累计净值
+        cum_ls = (1 + long_short_returns.fillna(0)).cumprod()
+
+        stats_pack = {
             'mean_return': long_short_returns.mean(),
             'std_return': long_short_returns.std(),
-            'sharpe_ratio': long_short_returns.mean() / long_short_returns.std() if long_short_returns.std() != 0 else np.nan,
-            'max_drawdown': self._calculate_max_drawdown(cumulative_ls_returns),
+            'sharpe_ratio': (long_short_returns.mean() / long_short_returns.std()) if long_short_returns.std() not in [0, np.nan] else np.nan,
+            'max_drawdown': self._calculate_max_drawdown(cum_ls),
             'win_rate': (long_short_returns > 0).mean(),
-            'total_return': cumulative_ls_returns.iloc[-1] - 1 if len(cumulative_ls_returns) > 0 else np.nan
+            'total_return': (cum_ls.iloc[-1] - 1) if len(cum_ls) else np.nan,
+            'annualized_return': self._calculate_annualized_return(long_short_returns)
         }
-        
+
+        annual_df = self._annual_stats_df(ic_stats['IC_series'], long_returns, short_returns, long_short_returns)
+
         return {
-            'long_short_returns': long_short_returns,
-            'cumulative_ls_returns': cumulative_ls_returns,
-            'long_returns': long_returns,
-            'short_returns': short_returns,
-            'stats': ls_stats
+            'ic_stats': ic_stats,
+            'long_short': {
+                'long_short_returns': long_short_returns,
+                'cumulative_ls_returns': cum_ls,
+                'long_returns': long_returns,
+                'short_returns': short_returns,
+                'stats': stats_pack
+            },
+            'annual_df': annual_df
         }
 
     def _calculate_max_drawdown(self, cumulative_returns):
-        """计算最大回撤"""
         if len(cumulative_returns) == 0:
             return np.nan
         running_max = cumulative_returns.expanding().max()
         drawdown = (cumulative_returns - running_max) / running_max
         return drawdown.min()
+    
+    def _calculate_annualized_return(self, daily_returns, trading_days_per_year=252):
+        """计算年化收益率"""
+        if len(daily_returns) == 0:
+            return np.nan
+        # 年化收益率 = (1 + 总收益率) ^ (年化天数/实际天数) - 1
+        total_return = (1 + daily_returns.fillna(0)).prod() - 1
+        years = len(daily_returns) / trading_days_per_year
+        if years <= 0:
+            return np.nan
+        annualized_return = (1 + total_return) ** (1 / years) - 1
+        return annualized_return
 
-    def calculate_barra_style_correlation(self):
-        """计算Barra风格因子相关性 (彻底向量化版本)"""
+    # ============== Barra 归因层：风格相关 + 行业暴露 ==============
+    def barra_analysis(self, positions_returns, n_groups=10):
+        """
+        将 Barra 相关的计算统一在一个函数中：
+        1) 风格因子相关性：factor_value 与 11个风格因子的日度相关 & 20日滚动均值
+        2) 行业暴露差异：使用“每日持仓”计算 long vs short 的行业暴露差异，并给出季度平均
+
+        返回：
+        {
+            'style_correlation': {
+                'daily_correlation': DataFrame[T×K],
+                'rolling_correlation': DataFrame[T×K],
+                'style_factors': list[str]
+            },
+            'industry_exposure': {
+                'long_exposure': DataFrame[T×Industry],
+                'short_exposure': DataFrame[T×Industry],
+                'exposure_diff': DataFrame[T×Industry],
+                'quarter_diff': DataFrame[Q×Industry],
+                'industry_factors': list[str]
+            }
+        } 或 None (若无 barra_data)
+        """
         if self.barra_data is None:
             return None
 
-        print("    计算Barra风格因子相关性...")
+        print("  [Barra] 计算风格相关性与行业暴露差异 ...")
 
-        # 获取风格因子列（前11列）
+        # ---- 风格因子相关性（与原始实现一致，彻底向量化） ----
         barra_columns = self.barra_data.columns.tolist()
-        style_factors = [col for col in barra_columns if col not in ['date', 'order_book_id']][:11]
+        style_factors = [c for c in barra_columns if c not in ['date', 'order_book_id']][:11]
 
-        # 构造因子宽表 (T × N)
-        factor_wide = self.factor_data.pivot(index='date', columns='order_book_id', values='factor_value')
-
-        # 构造所有风格因子宽表，堆叠成 (T × N × K)
+        # 构造因子宽表 T×N
+        factor_wide = self.factor_data.pivot(index='date', columns='order_book_id', values='factor_value').sort_index()
+        # 风格宽表堆叠 T×N×K
         barra_wide_all = []
         for f in style_factors:
-            wide = self.barra_data.pivot(index='date', columns='order_book_id', values=f)
+            wide = self.barra_data.pivot(index='date', columns='order_book_id', values=f).reindex_like(factor_wide)
             barra_wide_all.append(wide)
-        barra_wide_all = np.stack([df.reindex_like(factor_wide).to_numpy() for df in barra_wide_all], axis=-1)
+        Y = np.stack([df.to_numpy() for df in barra_wide_all], axis=-1)   # (T×N×K)
+        X = factor_wide.to_numpy()                                        # (T×N)
 
-        # 对齐
-        common_dates = factor_wide.index
-        X = factor_wide.to_numpy()                  # (T × N)
-        Y = barra_wide_all                          # (T × N × K)
         T, N = X.shape
         K = Y.shape[2]
+        mask_x = ~np.isnan(X)
+        mask_y = ~np.isnan(Y)
+        mask = mask_x[:, :, None] & mask_y
 
-        print(f"      处理 {K} 个风格因子，{T} 个日期...")
-
-        # mask (有效值位置)
-        mask_x = ~np.isnan(X)                       # (T × N)
-        mask_y = ~np.isnan(Y)                       # (T × N × K)
-        mask = mask_x[:, :, None] & mask_y          # (T × N × K)
-
-        # 中心化
-        Xc = np.where(mask, X[:, :, None], np.nan)  # (T × N × K)
+        Xc = np.where(mask, X[:, :, None], np.nan)
         Yc = np.where(mask, Y, np.nan)
 
-        mean_x = np.nanmean(Xc, axis=1, keepdims=True)   # (T × 1 × K)
-        mean_y = np.nanmean(Yc, axis=1, keepdims=True)   # (T × 1 × K)
+        mean_x = np.nanmean(Xc, axis=1, keepdims=True)
+        mean_y = np.nanmean(Yc, axis=1, keepdims=True)
+        Xc -= mean_x
+        Yc -= mean_y
 
-        Xc = Xc - mean_x
-        Yc = Yc - mean_y
+        cov = np.nansum(Xc * Yc, axis=1)      # T×K
+        var_x = np.nansum(Xc ** 2, axis=1)    # T×K
+        var_y = np.nansum(Yc ** 2, axis=1)    # T×K
+        corr = cov / np.sqrt(var_x * var_y)
+        valid_cnt = np.sum(mask, axis=1)      # T×K
+        corr[valid_cnt < 10] = np.nan
 
-        # 协方差与方差
-        cov = np.nansum(Xc * Yc, axis=1)                # (T × K)
-        var_x = np.nansum(Xc**2, axis=1)                # (T × K)
-        var_y = np.nansum(Yc**2, axis=1)                # (T × K)
+        daily_corr = pd.DataFrame(corr, index=factor_wide.index, columns=style_factors)
+        rolling_corr = daily_corr.rolling(window=20, min_periods=5).mean()
 
-        corr = cov / np.sqrt(var_x * var_y)             # (T × K)
-
-        # 最小样本数过滤 (例如>=10只股票)
-        valid_counts = np.sum(mask, axis=1)             # (T × K)
-        corr[valid_counts < 10] = np.nan
-
-        # 转换为 DataFrame
-        corr_df = pd.DataFrame(corr, index=common_dates, columns=style_factors)
-
-        # rolling 计算
-        rolling_corr = corr_df.rolling(window=20, min_periods=5).mean()
-
-        print(f"    完成，共计算 {len(corr_df)} 个交易日")
-
-        return {
-            'daily_correlation': corr_df,
+        style_pack = {
+            'daily_correlation': daily_corr,
             'rolling_correlation': rolling_corr,
             'style_factors': style_factors
         }
 
-        
-    def calculate_industry_exposure(self, n_groups=10):
-        """计算行业因子暴露差异 """
-        if self.barra_data is None:
-            return None
+        # ---- 行业暴露差异：使用每日持仓 ----
+        industry_factors = [c for c in barra_columns if c not in ['date', 'order_book_id']][-31:]
+        pos_daily = positions_returns['positions_daily']  # date, rb_date, order_book_id, group
 
-        print("    计算Barra行业因子暴露...")
+        if len(industry_factors) == 0 or len(pos_daily) == 0:
+            industry_pack = {
+                'long_exposure': pd.DataFrame(),
+                'short_exposure': pd.DataFrame(),
+                'exposure_diff': pd.DataFrame(),
+                'quarter_diff': pd.DataFrame(),
+                'industry_factors': industry_factors
+            }
+            return {'style_correlation': style_pack, 'industry_exposure': industry_pack}
 
-        # 获取行业因子列
-        barra_columns = self.barra_data.columns.tolist()
-        industry_factors = [col for col in barra_columns if col not in ['date', 'order_book_id']][-31:]
+        # 合并持仓与行业暴露
+        barra_use = self.barra_data[['date', 'order_book_id'] + industry_factors].copy()
+        merged = pos_daily.merge(barra_use, on=['date', 'order_book_id'], how='left')
 
-        # 获取分组数据
-        group_data = self.create_decile_groups(n_groups)
-        group_labels = group_data['group_labels']
-        if group_labels.empty:
-            return None
+        exp_daily = merged.groupby(['date', 'group'])[industry_factors].mean()  # 每日分组平均暴露
+        # 多空分组：与绩效处一致（用IC方向）
+        ic_stats = self.compute_ic_and_stats()
+        first_ic_key = [k for k in ic_stats.keys() if k != 'IC_series'][0]
+        ic_mean = ic_stats[first_ic_key]['IC_mean']
+        long_group, short_group = (len(industry_factors) - 1, 0)
+        # 注意：上行错误。应按 n_groups 决定
+        n_groups = merged['group'].dropna().astype(int).max() + 1 if merged['group'].notna().any() else 10
+        if pd.isna(ic_mean) or ic_mean >= 0:
+            long_group, short_group = n_groups - 1, 0
+        else:
+            long_group, short_group = 0, n_groups - 1
 
-        long_group = n_groups - 1
-        short_group = 0
+        if (long_group in exp_daily.index.get_level_values('group')) and (short_group in exp_daily.index.get_level_values('group')):
+            long_exposure = exp_daily.xs(long_group, level='group')
+            short_exposure = exp_daily.xs(short_group, level='group')
+            exposure_diff = long_exposure - short_exposure
+        else:
+            long_exposure = pd.DataFrame(columns=industry_factors)
+            short_exposure = pd.DataFrame(columns=industry_factors)
+            exposure_diff = pd.DataFrame(columns=industry_factors)
 
-        # 合并 group_labels 和 barra_data，一次性处理
-        merged = pd.merge(
-            group_labels,
-            self.barra_data[['date', 'order_book_id'] + industry_factors],
-            on=['date', 'order_book_id'],
-            how='inner'
-        )
+        # 季度统计
+        for df in [long_exposure, short_exposure, exposure_diff]:
+            if not isinstance(df.index, pd.DatetimeIndex) and len(df) > 0:
+                df.index = pd.to_datetime(df.index)
 
-        # 按日期+组别，计算行业暴露均值
-        exposure = merged.groupby(['date', 'group'])[industry_factors].mean()
-
-        # 多头和空头分别取出来
-        long_exposure = exposure.xs(long_group, level='group')
-        short_exposure = exposure.xs(short_group, level='group')
-
-        # 计算差异
-        exposure_diff = long_exposure - short_exposure
-
-        # 半年聚合 - 优化精度
-        long_exposure.index = pd.to_datetime(long_exposure.index)
-        short_exposure.index = pd.to_datetime(short_exposure.index)
-        exposure_diff.index = pd.to_datetime(exposure_diff.index)
-
-        # 按季度聚合
-        quarter_diff = exposure_diff.resample('Q').mean()
-        
-        # 设置最小阈值，减少噪声
-        threshold = 0.00001
+        quarter_diff = exposure_diff.resample('Q').mean() if len(exposure_diff) else pd.DataFrame(columns=industry_factors)
+        threshold = 1e-5
         quarter_diff = quarter_diff.where(quarter_diff.abs() >= threshold, 0)
 
-        print(f"    完成，共计算 {len(quarter_diff)} 个季度")
-
-        return {
+        industry_pack = {
             'long_exposure': long_exposure,
             'short_exposure': short_exposure,
             'exposure_diff': exposure_diff,
@@ -443,317 +547,278 @@ class SingleFactorAnalyzer:
             'industry_factors': industry_factors
         }
 
+        return {
+            'style_correlation': style_pack,
+            'industry_exposure': industry_pack
+        }
 
-
-
-    def _annual_stats_df(self, ic_series, long_returns, short_returns, long_short_returns):
-        """计算年度统计"""
-        # 对齐数据
-        for s in [ic_series, long_returns, short_returns, long_short_returns]:
-            if not isinstance(s.index, pd.DatetimeIndex):
-                s.index = pd.to_datetime(s.index)
-        
-        common_index = ic_series.index.intersection(long_returns.index).intersection(short_returns.index).intersection(long_short_returns.index)
-        ic_series = ic_series.reindex(common_index)
-        long_returns = long_returns.reindex(common_index)
-        short_returns = short_returns.reindex(common_index)
-        long_short_returns = long_short_returns.reindex(common_index)
-        
-        # 按年度计算统计
-        years = ic_series.index.to_series().dt.year.unique()
-        stats = []
-        
-        for year in sorted(years):
-            mask = ic_series.index.year == year
-            ic_mean = ic_series[mask].mean()
-            long_ret = long_returns[mask]
-            short_ret = short_returns[mask]
-            ls_ret = long_short_returns[mask]
-            
-            long_annual = (1 + long_ret).prod() - 1 if long_ret.notna().sum() > 0 else np.nan
-            short_annual = (1 + short_ret).prod() - 1 if short_ret.notna().sum() > 0 else np.nan
-            
-            sharpe = np.nan
-            if ls_ret.std() and ls_ret.notna().sum() > 1:
-                sharpe = (ls_ret.mean() / ls_ret.std()) * np.sqrt(252)
-            
-            cum = (1 + ls_ret.fillna(0)).cumprod()
-            max_dd = np.nan
-            if len(cum) > 0:
-                running_max = cum.expanding().max()
-                drawdown = (cum - running_max) / running_max
-                max_dd = drawdown.min()
-            
-            stats.append({
-                '年度': str(year),
-                'IC均值': ic_mean,
-                '多头收益': long_annual,
-                '空头收益': short_annual,
-                '多空夏普': sharpe,
-                '多空最大回撤': max_dd
-            })
-        
-        df = pd.DataFrame(stats)
-        for col in ['多头收益', '空头收益', '多空最大回撤']:
-            df[col] = df[col] * 100
-        return df
-
-    def plot_full_analysis(self, method='spearman', n_groups=10, figsize=(16, 28), show_plot=True, 
-                          precomputed_data=None, save_path=None, show_log_returns=True):
-        """绘制完整分析图表 - 使用pyecharts生成HTML"""
+    # ============== 可视化：沿用原结构，内部调用新流程输出 ==============
+    def plot_full_analysis(self, method='spearman', n_groups=10, figsize=(16, 28),
+                           show_plot=True, precomputed_data=None, save_path=None, show_log_returns=True):
+        """
+        使用 pyecharts 生成 HTML 报告（布局与原版一致，但对接新的三段式流程）
+        """
         if precomputed_data is None:
-            # 计算数据
-            ic_stats = self.calculate_icir(method)
+            # 交易层
+            pos_ret = self.compute_positions_and_returns(n_groups=n_groups)
+            group_daily_returns = pos_ret['group_daily_returns']
+            group_cum_nav = pos_ret['group_cum_nav']
+
+            # 绩效层
+            perf = self.analyze_performance(pos_ret, method=method, n_groups=n_groups)
+            ic_stats = perf['ic_stats']
             ic_series = ic_stats['IC_series']
-            returns_data = self.calculate_returns(n_groups)
-            group_data = returns_data['group_returns']
-            group_returns = group_data['group_returns']
-            cumulative_returns = returns_data['cumulative_returns']
-            long_short_data = returns_data['long_short_returns']
-            
+            long_short_data = perf['long_short']
             long_short_returns = long_short_data['long_short_returns']
             cumulative_ls_returns = long_short_data['cumulative_ls_returns']
             long_returns = long_short_data['long_returns']
             short_returns = long_short_data['short_returns']
             ls_stats = long_short_data['stats']
-            
-            # 计算动态回撤
-            running_max = cumulative_ls_returns.expanding().max()
-            drawdown = (cumulative_ls_returns - running_max) / running_max
-            
-            # 计算分组累计收益
-            group_cumulative_returns = cumulative_returns.iloc[-1] if len(cumulative_returns) > 0 else pd.Series([np.nan] * n_groups)
-            
-            # 计算Barra相关数据
-            barra_style_corr = self.calculate_barra_style_correlation()
-            barra_industry_exposure = self.calculate_industry_exposure(n_groups)
+            annual_df = perf['annual_df']
+
+            # 组累计收益（最终点）
+            if len(group_cum_nav) > 0:
+                group_cumulative_last = group_cum_nav.iloc[-1]
+            else:
+                group_cumulative_last = pd.Series([np.nan] * n_groups, index=range(n_groups))
+
+            # Barra 归因
+            barra_all = self.barra_analysis(pos_ret, n_groups=n_groups)
         else:
-            # 使用预计算的数据
+            # 兼容旧接口
             ic_stats = precomputed_data['ic_stats']
             ic_series = precomputed_data['ic_series']
-            group_returns = precomputed_data['group_returns']['group_returns']
-            cumulative_returns = precomputed_data['cumulative_returns']
+            group_daily_returns = precomputed_data['group_returns']['group_returns']
+            group_cum_nav = precomputed_data['cumulative_returns']
             long_returns = precomputed_data['long_short_returns']['long_returns']
             short_returns = precomputed_data['long_short_returns']['short_returns']
             long_short_returns = precomputed_data['long_short_returns']['long_short_returns']
             cumulative_ls_returns = precomputed_data['long_short_returns']['cumulative_ls_returns']
-            running_max = cumulative_ls_returns.expanding().max()
-            drawdown = (cumulative_ls_returns - running_max) / running_max
             ls_stats = precomputed_data['long_short_stats']
-            group_cumulative_returns = cumulative_returns.iloc[-1] if len(cumulative_returns) > 0 else pd.Series([np.nan] * n_groups)
             
-            barra_style_corr = precomputed_data.get('barra_style_corr')
-            barra_industry_exposure = precomputed_data.get('barra_industry_exposure')
+            # 构造 long_short_data 以保持一致性
+            long_short_data = {
+                'long_short_returns': long_short_returns,
+                'cumulative_ls_returns': cumulative_ls_returns,
+                'long_returns': long_returns,
+                'short_returns': short_returns,
+                'stats': ls_stats
+            }
             
-            if barra_style_corr is None:
-                barra_style_corr = self.calculate_barra_style_correlation()
-            if barra_industry_exposure is None:
-                barra_industry_exposure = self.calculate_industry_exposure(n_groups)
+            if 'annual_df' in precomputed_data:
+                annual_df = precomputed_data['annual_df']
+            else:
+                annual_df = self._annual_stats_df(ic_series, long_returns, short_returns, long_short_returns)
 
-        # 准备文本信息 - 使用IC1的统计信息
-        ic1_stats = ic_stats.get('IC1', {})
-        ic_stats_text = (
-            f"IC1均值: {ic1_stats.get('IC_mean', np.nan):.4f}<br/>"
-            f"IC1标准差: {ic1_stats.get('IC_std', np.nan):.4f}<br/>"
-            f"IC1IR: {ic1_stats.get('ICIR', np.nan):.4f}<br/>"
-            f"IC1正比例: {ic1_stats.get('IC_positive_ratio', np.nan):.2%}<br/>"
-            f"IC1偏度: {ic1_stats.get('IC_skew', np.nan):.4f}<br/>"
-            f"IC1峰度: {ic1_stats.get('IC_kurtosis', np.nan):.4f}<br/>"
-            f"IC1t值: {ic1_stats.get('IC_tvalue', np.nan):.4f}<br/>"
-            f"IC1p值: {ic1_stats.get('IC_pvalue', np.nan):.4g}"
-        )
-        
-        stats_text = (
-            f"平均收益: {ls_stats['mean_return']:.4f}<br/>"
-            f"收益率标准差: {ls_stats['std_return']:.4f}<br/>"
-            f"夏普比率: {ls_stats['sharpe_ratio']:.4f}<br/>"
-            f"胜率: {ls_stats['win_rate']:.2%}<br/>"
-            f"最大回撤: {ls_stats['max_drawdown']:.2%}<br/>"
-            f"总收益: {ls_stats['total_return']:.2%}"
-        )
-        
-        annual_df = self._annual_stats_df(ic_series, long_returns, short_returns, long_short_returns)
+            if len(group_cum_nav) > 0:
+                group_cumulative_last = group_cum_nav.iloc[-1]
+            else:
+                group_cumulative_last = pd.Series([np.nan] * group_daily_returns.shape[1])
 
-        # 创建pyecharts图表
-        # 1. IC月度均值和累计值
-        ic_df = ic_series.to_frame('ic')
-        ic_df.index = pd.to_datetime(ic_df.index)
+            barra_all = precomputed_data.get('barra_all')
+            if barra_all is None:
+                # 尝试现算
+                fake_pos_ret = {
+                    'positions_daily': pd.DataFrame(),
+                    'group_daily_returns': group_daily_returns,
+                    'group_cum_nav': group_cum_nav,
+                    'rebalance_info': {'rebalance_dates': self.rebalance_dates, 'group_labels_rebalance': pd.DataFrame()}
+                }
+                barra_all = self.barra_analysis(fake_pos_ret, n_groups=group_daily_returns.shape[1])
+
+        # ---- 构建图表 ----
+        from pyecharts.charts import Page
+        page = Page(layout=Page.SimplePageLayout)
+
+        # 1) IC月度均值 & 累计值
+        ic_df = ic_series.to_frame('ic'); ic_df.index = pd.to_datetime(ic_df.index)
         ic_cum = ic_df['ic'].cumsum()
         ic_monthly_mean = ic_df.resample('M').mean()
         ic_monthly_mean.index = ic_monthly_mean.index.to_period('M').to_timestamp()
-        
+
         ic_chart = (
             Bar()
             .add_xaxis([d.strftime('%Y-%m') for d in ic_monthly_mean.index])
             .add_yaxis("IC月度均值", ic_monthly_mean['ic'].round(4).tolist(), yaxis_index=0,
-                      label_opts=opts.LabelOpts(is_show=False))
-            .extend_axis(
-                yaxis=opts.AxisOpts(
-                    name="IC累计值",
-                    type_="value",
-                    position="right",
-                )
-            )
+                       label_opts=opts.LabelOpts(is_show=False))
+            .extend_axis(yaxis=opts.AxisOpts(name="IC累计值", type_="value", position="right"))
             .set_global_opts(
                 title_opts=opts.TitleOpts(title=f"{self.factor_name} - IC月度均值 & IC累计值 (调仓周期: {self.rebalance_period})"),
-                xaxis_opts=opts.AxisOpts(
-                    name="月份",
-                    type_="category",
-                    axislabel_opts=opts.LabelOpts(rotate=45)
-                ),
-                yaxis_opts=opts.AxisOpts(
-                    name="IC月度均值",
-                    is_scale=True,
-                    axislabel_opts=opts.LabelOpts(is_show=False),
-                    axisline_opts=opts.AxisLineOpts(is_show=False),
-                    axistick_opts=opts.AxisTickOpts(is_show=False)
-                ),
+                xaxis_opts=opts.AxisOpts(type_="category", axislabel_opts=opts.LabelOpts(rotate=45)),
+                yaxis_opts=opts.AxisOpts(name="IC月度均值", is_scale=True,
+                                         axislabel_opts=opts.LabelOpts(is_show=False),
+                                         axisline_opts=opts.AxisLineOpts(is_show=False),
+                                         axistick_opts=opts.AxisTickOpts(is_show=False)),
                 datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
                 legend_opts=opts.LegendOpts(pos_top="5%"),
                 tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
             )
         )
-        
         ic_line = (
             Line()
             .add_xaxis([d.strftime('%Y-%m') for d in ic_cum.index])
             .add_yaxis("IC累计值", ic_cum.round(4).tolist(), yaxis_index=1,
-                      label_opts=opts.LabelOpts(is_show=False),
-                      symbol_size=0)
+                       label_opts=opts.LabelOpts(is_show=False), symbol_size=0)
         )
-        
         ic_chart.overlap(ic_line)
+        page.add(ic_chart)
 
-        # 2. 各分组累计收益率
+        # 2) 各分组累计收益率
         group_chart = Line()
-        if show_log_returns:
-            for group in range(n_groups):
-                if group in cumulative_returns.columns:
-                    log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
-                    group_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_returns.index])
-                    group_chart.add_yaxis(f"分组{group+1}", log_returns.round(4).tolist(),
-                                       label_opts=opts.LabelOpts(is_show=False),
-                                       symbol_size=0)
-            title = f"{self.factor_name} - 各分组累计对数收益率(log10)"
-        else:
-            for group in range(n_groups):
-                if group in cumulative_returns.columns:
-                    group_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_returns.index])
-                    group_chart.add_yaxis(f"分组{group+1}", cumulative_returns[group].round(4).tolist(),
-                                       label_opts=opts.LabelOpts(is_show=False),
-                                       symbol_size=0)
-            title = f"{self.factor_name} - 各分组累计收益率"
-        
+        if len(group_cum_nav) > 0:
+            for g in group_cum_nav.columns:
+                vals = np.log10(group_cum_nav[g].replace(0, np.nan)) if show_log_returns else group_cum_nav[g]
+                group_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in group_cum_nav.index])
+                group_chart.add_yaxis(f"分组{int(g)+1}", vals.round(4).tolist(),
+                                      label_opts=opts.LabelOpts(is_show=False), symbol_size=0)
         group_chart.set_global_opts(
-            title_opts=opts.TitleOpts(title=title),
-            xaxis_opts=opts.AxisOpts(
-                name="日期",
-                type_="category",
-                axislabel_opts=opts.LabelOpts(rotate=45)
-            ),
-                            yaxis_opts=opts.AxisOpts(
-                    name="累计收益率",
-                    is_scale=True,
-                    axislabel_opts=opts.LabelOpts(is_show=False),
-                    axisline_opts=opts.AxisLineOpts(is_show=False),
-                    axistick_opts=opts.AxisTickOpts(is_show=False)
-                ),
+            title_opts=opts.TitleOpts(title=f"{self.factor_name} - 各分组累计{'对数' if show_log_returns else ''}收益率"),
+            xaxis_opts=opts.AxisOpts(type_="category", axislabel_opts=opts.LabelOpts(rotate=45)),
+            yaxis_opts=opts.AxisOpts(is_scale=True,
+                                     axislabel_opts=opts.LabelOpts(is_show=False),
+                                     axisline_opts=opts.AxisLineOpts(is_show=False),
+                                     axistick_opts=opts.AxisTickOpts(is_show=False)),
             datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
             legend_opts=opts.LegendOpts(pos_top="5%"),
             tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
         )
+        page.add(group_chart)
 
-        # 3. 多空累计收益和动态回撤
+        # 3) 多空累计收益 + 动态回撤阴影
+        cumulative_ls_returns = long_short_data['cumulative_ls_returns']
+        running_max = cumulative_ls_returns.expanding().max()
+        drawdown = (cumulative_ls_returns - running_max) / running_max if len(cumulative_ls_returns) else pd.Series(dtype=float)
+
         ls_chart = (
             Line()
             .add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_ls_returns.index])
             .add_yaxis("多空累计收益", cumulative_ls_returns.round(4).tolist(), yaxis_index=0,
-                      label_opts=opts.LabelOpts(is_show=False),
-                      symbol_size=0)
-            .extend_axis(
-                yaxis=opts.AxisOpts(
-                    name="动态回撤",
-                    type_="value",
-                    position="right",
-                    is_inverse=True
-                )
-            )
+                       label_opts=opts.LabelOpts(is_show=False), symbol_size=0)
+            .extend_axis(yaxis=opts.AxisOpts(name="动态回撤", type_="value", position="right", is_inverse=True))
             .set_global_opts(
                 title_opts=opts.TitleOpts(title=f"{self.factor_name} - 多空累计收益及动态回撤 (调仓周期: {self.rebalance_period})"),
-                xaxis_opts=opts.AxisOpts(
-                    name="日期",
-                    type_="category",
-                    axislabel_opts=opts.LabelOpts(rotate=45)
-                ),
-                yaxis_opts=opts.AxisOpts(
-                    name="累计收益",
-                    is_scale=True,
-                    axislabel_opts=opts.LabelOpts(is_show=False),
-                    axisline_opts=opts.AxisLineOpts(is_show=False),
-                    axistick_opts=opts.AxisTickOpts(is_show=False)
-                ),
+                xaxis_opts=opts.AxisOpts(type_="category", axislabel_opts=opts.LabelOpts(rotate=45)),
+                yaxis_opts=opts.AxisOpts(name="累计收益", is_scale=True,
+                                         axislabel_opts=opts.LabelOpts(is_show=False),
+                                         axisline_opts=opts.AxisLineOpts(is_show=False),
+                                         axistick_opts=opts.AxisTickOpts(is_show=False)),
                 datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
                 legend_opts=opts.LegendOpts(pos_top="5%"),
                 tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
             )
         )
-        
         if len(drawdown) > 0:
-            # 使用面积图显示动态回撤为灰色阴影
-            drawdown_area = (
+            dd_area = (
                 Line()
                 .add_xaxis([d.strftime('%Y-%m-%d') for d in drawdown.index])
-                .add_yaxis(
-                    "动态回撤", 
-                    drawdown.round(4).tolist(), 
-                    yaxis_index=1,
-                    is_symbol_show=False,
-                    linestyle_opts=opts.LineStyleOpts(width=0),
-                    itemstyle_opts=opts.ItemStyleOpts(color="rgba(128,128,128,0.3)"),
-                    label_opts=opts.LabelOpts(is_show=False)
-                )
-                .set_series_opts(
-                    areastyle_opts=opts.AreaStyleOpts(
-                        color="rgba(128,128,128,0.3)",
-                        opacity=0.3
-                    )
-                )
+                .add_yaxis("动态回撤", drawdown.round(4).tolist(), yaxis_index=1,
+                           is_symbol_show=False,
+                           linestyle_opts=opts.LineStyleOpts(width=0),
+                           label_opts=opts.LabelOpts(is_show=False))
+                .set_series_opts(areastyle_opts=opts.AreaStyleOpts(opacity=0.3))
             )
-            ls_chart.overlap(drawdown_area)
+            ls_chart.overlap(dd_area)
+        page.add(ls_chart)
 
-        # 4. 分组累计收益率柱状图
+        # 4) 分组累计收益率柱状图（期末）
         group_bar = (
             Bar()
-            .add_xaxis([f"分组{i+1}" for i in range(n_groups)])
-            .add_yaxis("累计收益率", group_cumulative_returns.round(4).tolist(),
-                      label_opts=opts.LabelOpts(is_show=False))
+            .add_xaxis([f"分组{i+1}" for i in range(len(group_cumulative_last))])
+            .add_yaxis("累计收益率", group_cumulative_last.round(4).tolist(),
+                       label_opts=opts.LabelOpts(is_show=False))
             .set_global_opts(
                 title_opts=opts.TitleOpts(title=f"{self.factor_name} - 各分组累计收益率"),
-                xaxis_opts=opts.AxisOpts(
-                    name="分组",
-                    type_="category"
-                ),
-                yaxis_opts=opts.AxisOpts(
-                    name="累计收益率",
-                    is_scale=True,
-                    axislabel_opts=opts.LabelOpts(is_show=False),
-                    axisline_opts=opts.AxisLineOpts(is_show=False),
-                    axistick_opts=opts.AxisTickOpts(is_show=False)
-                ),
+                xaxis_opts=opts.AxisOpts(type_="category"),
+                yaxis_opts=opts.AxisOpts(is_scale=True,
+                                         axislabel_opts=opts.LabelOpts(is_show=False),
+                                         axisline_opts=opts.AxisLineOpts(is_show=False),
+                                         axistick_opts=opts.AxisTickOpts(is_show=False)),
                 datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
                 legend_opts=opts.LegendOpts(pos_top="5%"),
                 tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
             )
         )
+        page.add(group_bar)
 
-        # 5. IC统计信息表格
+
+
+        # 7) Barra 风格相关时序 & 8) 行业暴露热力图（第三行）
+        if barra_all is not None:
+            # 风格
+            style_corr = barra_all['style_correlation']
+            daily_corr = style_corr['daily_correlation']
+            style_factors = style_corr['style_factors']
+            barra_style_chart = Line()
+            for f in style_factors:
+                if f in daily_corr.columns:
+                    barra_style_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in daily_corr.index])
+                    barra_style_chart.add_yaxis(f, daily_corr[f].round(4).tolist(),
+                                                label_opts=opts.LabelOpts(is_show=False), symbol_size=0)
+            barra_style_chart.set_global_opts(
+                title_opts=opts.TitleOpts(title=f"{self.factor_name} - 与Barra风格因子相关系数（日度）"),
+                xaxis_opts=opts.AxisOpts(type_="category", axislabel_opts=opts.LabelOpts(rotate=45)),
+                yaxis_opts=opts.AxisOpts(name="相关系数", is_scale=True, min_=-1, max_=1,
+                                         axislabel_opts=opts.LabelOpts(is_show=False),
+                                         axisline_opts=opts.AxisLineOpts(is_show=False),
+                                         axistick_opts=opts.AxisTickOpts(is_show=False)),
+                datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
+                legend_opts=opts.LegendOpts(pos_top="5%"),
+                tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
+            )
+            page.add(barra_style_chart)
+
+        # 行业热力图
+        industry_heatmap = None
+        if barra_all is not None:
+            industry_pack = barra_all['industry_exposure']
+            quarter_diff = industry_pack['quarter_diff']
+            if len(quarter_diff) > 0:
+                heatmap_data = []
+                time_labels = []
+                for idx in quarter_diff.index:
+                    year = idx.year
+                    quarter = (idx.month - 1) // 3 + 1
+                    time_labels.append(f"{year}Q{quarter}")
+                for i, _t in enumerate(quarter_diff.index):
+                    for j, ind in enumerate(quarter_diff.columns):
+                        v = quarter_diff.loc[_t, ind]
+                        if pd.notna(v):
+                            heatmap_data.append([i, j, round(float(v), 4)])
+
+                # 颜色范围
+                abs_max = quarter_diff.abs().max().max()
+                if abs_max > 0:
+                    q95 = quarter_diff.abs().quantile(0.95).max()
+                    color_range = float(min(abs_max, q95 * 1.2))
+                else:
+                    color_range = 0.01
+
+                industry_heatmap = (
+                    HeatMap()
+                    .add_xaxis(time_labels)
+                    .add_yaxis("行业因子", list(quarter_diff.columns), heatmap_data,
+                               label_opts=opts.LabelOpts(is_show=False))
+                    .set_global_opts(
+                        title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异（季度统计）"),
+                        xaxis_opts=opts.AxisOpts(type_="category", axislabel_opts=opts.LabelOpts(rotate=45)),
+                        yaxis_opts=opts.AxisOpts(type_="category"),
+                        visualmap_opts=opts.VisualMapOpts(
+                            min_=-color_range, max_=color_range, pos_left="right",
+                            is_calculable=True, split_number=10,
+                            range_color=["#0000FF", "#FFFFFF", "#FF0000"]  # 蓝色(负值) -> 白色(0) -> 红色(正值)
+                        )
+                    )
+                )
+        if industry_heatmap is not None:
+            page.add(industry_heatmap)
+
+        # 9) 数据表部分（第四行）
         from pyecharts.components import Table
         
-        # 准备IC1到IC5的统计信息 - 5列表格
-        headers = ["指标", "IC1", "IC2", "IC3", "IC4", "IC5"]
+        # IC统计信息表格（动态获取IC键名）
+        ic_keys = [k for k in ic_stats.keys() if k != 'IC_series']
+        headers = ["指标"] + ic_keys
         ic_table_data = []
-        
-        # 定义指标行
         metrics = [
             ("IC均值", "IC_mean", ":.4f"),
             ("IC标准差", "IC_std", ":.4f"),
@@ -764,216 +829,40 @@ class SingleFactorAnalyzer:
             ("t值", "IC_tvalue", ":.4f"),
             ("p值", "IC_pvalue", ":.4g")
         ]
-        
-        for metric_name, metric_key, format_str in metrics:
+        for metric_name, metric_key, fmt in metrics:
             row = [metric_name]
-            for lag in range(1, 6):
-                ic_key = f'IC{lag}'
-                if ic_key in ic_stats:
-                    value = ic_stats[ic_key].get(metric_key, np.nan)
-                    if not pd.isna(value):
-                        if format_str == ":.2%":
-                            row.append(f"{value:.2%}")
-                        elif format_str == ":.4g":
-                            row.append(f"{value:.4g}")
-                        else:
-                            row.append(f"{value:.4f}")
-                    else:
-                        row.append("NaN")
-                else:
+            for ic_key in ic_keys:
+                val = ic_stats.get(ic_key, {}).get(metric_key, np.nan)
+                if pd.isna(val):
                     row.append("NaN")
+                else:
+                    if fmt == ":.2%":
+                        row.append(f"{val:.2%}")
+                    elif fmt == ":.4g":
+                        row.append(f"{val:.4g}")
+                    else:
+                        row.append(f"{val:.4f}")
             ic_table_data.append(row)
-        
-        ic_table = (
-            Table()
-            .add(headers, ic_table_data)
-            .set_global_opts(
-                title_opts=opts.TitleOpts(title=f"{self.factor_name} - IC1到IC5统计信息", pos_left="center")
-            )
+        ic_table = Table().add(headers, ic_table_data).set_global_opts(
+            title_opts=opts.TitleOpts(title=f"{self.factor_name} - IC统计信息", pos_left="center")
         )
+        page.add(ic_table)
 
-        # 6. 多空组合统计信息表格
-        stats_table = (
-            Table()
-            .add(["指标", "数值"], [
+        # 多空组合统计信息表格
+        stats_table = Table().add(
+            ["指标", "数值"],
+            [
                 ["平均收益", f"{ls_stats['mean_return']:.4f}"],
                 ["收益率标准差", f"{ls_stats['std_return']:.4f}"],
                 ["夏普比率", f"{ls_stats['sharpe_ratio']:.4f}"],
                 ["胜率", f"{ls_stats['win_rate']:.2%}"],
                 ["最大回撤", f"{ls_stats['max_drawdown']:.2%}"],
                 ["总收益", f"{ls_stats['total_return']:.2%}"]
-            ])
-            .set_global_opts(
-                title_opts=opts.TitleOpts(title=f"{self.factor_name} - 多空组合统计信息", pos_left="center")
-            )
-        )
+            ]
+        ).set_global_opts(title_opts=opts.TitleOpts(title=f"{self.factor_name} - 多空组合统计信息", pos_left="center"))
+        page.add(stats_table)
 
-        # 7. Barra风格因子相关系数
-        if barra_style_corr is not None:
-            daily_corr = barra_style_corr['daily_correlation']
-            style_factors = barra_style_corr['style_factors']
-            
-            barra_style_chart = Line()
-            for factor in style_factors:
-                if factor in daily_corr.columns:
-                    barra_style_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in daily_corr.index])
-                    barra_style_chart.add_yaxis(factor, daily_corr[factor].round(4).tolist(),
-                                             label_opts=opts.LabelOpts(is_show=False),
-                                             symbol_size=0)
-            
-            barra_style_chart.set_global_opts(
-                title_opts=opts.TitleOpts(title=f"{self.factor_name} - 与Barra风格因子相关系数（日度）"),
-                xaxis_opts=opts.AxisOpts(
-                    name="日期",
-                    type_="category",
-                    axislabel_opts=opts.LabelOpts(rotate=45)
-                ),
-                yaxis_opts=opts.AxisOpts(
-                    name="相关系数",
-                    is_scale=True,
-                    min_=-1,
-                    max_=1,
-                    axislabel_opts=opts.LabelOpts(is_show=False),
-                    axisline_opts=opts.AxisLineOpts(is_show=False),
-                    axistick_opts=opts.AxisTickOpts(is_show=False)
-                ),
-                datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
-                legend_opts=opts.LegendOpts(pos_top="5%"),
-                tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
-            )
-        else:
-            from pyecharts.components import Table
-            barra_style_chart = (
-                Table()
-                .add(["Barra风格因子相关性"], [["无Barra数据"]])
-                .set_global_opts(
-                    title_opts=opts.TitleOpts(title=f"{self.factor_name} - Barra风格因子相关性")
-                )
-            )
-
-        # 8. 行业因子暴露比例热力图
-        if barra_industry_exposure is not None:
-            quarter_diff = barra_industry_exposure['quarter_diff']
-            industry_factors = barra_industry_exposure['industry_factors']
-            
-            if len(quarter_diff) > 0:
-                # 准备热力图数据
-                heatmap_data = []
-                
-                # 正确处理行业因子热力图数据
-                try:
-                    # 发现数据结构：时间(行) × 行业因子(列)
-                    print(f"      热力图数据形状: {quarter_diff.shape}")
-                    print(f"      时间（行索引）: {quarter_diff.index.tolist()[:3]}")
-                    print(f"      行业因子（列索引）: {quarter_diff.columns.tolist()[:3]}")
-                    
-                    # 正确的迭代：时间作为X轴，行业因子作为Y轴
-                    for i, time_period in enumerate(quarter_diff.index):  # 时间作为X轴
-                        for j, industry_factor in enumerate(quarter_diff.columns):  # 行业因子作为Y轴
-                            try:
-                                value = quarter_diff.loc[time_period, industry_factor]
-                                if not pd.isna(value):
-                                    heatmap_data.append([i, j, round(float(value), 4)])
-                            except Exception as e:
-                                print(f"        跳过数据点 [{time_period}, {industry_factor}]: {e}")
-                                continue
-                    
-                    if heatmap_data:
-                        # 格式化时间标签 - 按季度显示
-                        time_labels = []
-                        for idx in quarter_diff.index:
-                            if hasattr(idx, 'strftime'):
-                                # 显示季度格式：2023Q1, 2023Q2等
-                                year = idx.year
-                                quarter = (idx.month - 1) // 3 + 1
-                                time_labels.append(f"{year}Q{quarter}")
-                            else:
-                                time_labels.append(str(idx))
-                        
-                        # 优化热力图精度和颜色映射
-                        # 计算更精确的数值范围，避免0值过多
-                        abs_max = quarter_diff.abs().max().max()
-                        if abs_max > 0:
-                            # 使用95分位数来设置范围，减少极值影响
-                            quantile_95 = quarter_diff.abs().quantile(0.95).max()
-                            color_range = min(abs_max, quantile_95 * 1.2)
-                        else:
-                            color_range = 0.01  # 避免全为0的情况
-                        
-                        # 优化颜色映射，增加中间色调的区分度
-                        industry_heatmap = (
-                            HeatMap()
-                            .add_xaxis(time_labels)
-                            .add_yaxis("行业因子", list(quarter_diff.columns), heatmap_data,
-                                     label_opts=opts.LabelOpts(is_show=False))
-                            .set_global_opts(
-                                title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异（季度统计）"),
-                                xaxis_opts=opts.AxisOpts(
-                                    name="时间（季度）",
-                                    type_="category",
-                                    axislabel_opts=opts.LabelOpts(rotate=45)
-                                ),
-                                yaxis_opts=opts.AxisOpts(
-                                    name="行业因子",
-                                    type_="category"
-                                ),
-                                visualmap_opts=opts.VisualMapOpts(
-                                    min_=-color_range,
-                                    max_=color_range,
-                                    pos_left="right",
-                                    is_calculable=True,
-                                    range_color=[
-                                        "#313695", "#4575b4", "#74add1", "#abd9e9", "#e0f3f8", 
-                                        "#ffffcc", "#fee090", "#fdae61", "#f46d43", "#d73027", "#a50026"
-                                    ],
-                                    # 增加精度显示
-                                    precision=4,
-                                    # 优化分段
-                                    split_number=10
-                                )
-                            )
-                        )
-                        print(f"      热力图生成成功，数据点数量: {len(heatmap_data)}")
-                    else:
-                        from pyecharts.components import Table
-                        industry_heatmap = (
-                            Table()
-                            .add(["行业因子多空暴露差异"], [["热力图数据为空"]])
-                            .set_global_opts(
-                                title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异")
-                            )
-                        )
-                except Exception as e:
-                    print(f"      警告：热力图生成失败，使用表格替代: {e}")
-                    from pyecharts.components import Table
-                    industry_heatmap = (
-                        Table()
-                        .add(["行业因子多空暴露差异"], [["热力图生成失败"]])
-                        .set_global_opts(
-                            title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异")
-                        )
-                    )
-            else:
-                from pyecharts.components import Table
-                industry_heatmap = (
-                    Table()
-                    .add(["行业因子多空暴露差异"], [["无季度统计数据"]])
-                    .set_global_opts(
-                        title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异")
-                    )
-                )
-        else:
-            from pyecharts.components import Table
-            industry_heatmap = (
-                Table()
-                .add(["行业因子多空暴露差异"], [["无Barra数据"]])
-                .set_global_opts(
-                    title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异")
-                )
-            )
-
-        # 9. 年度统计表
-        from pyecharts.components import Table
+        # 年度统计表
         annual_table_data = []
         for i, row in annual_df.iterrows():
             annual_table_data.append([
@@ -992,97 +881,121 @@ class SingleFactorAnalyzer:
                 title_opts=opts.TitleOpts(title="年度统计表", pos_left="center")
             )
         )
+        page.add(annual_table)
 
-        # 生成HTML文件
+        # 生成 HTML
         if save_path is None:
             save_path = f"{self.factor_name}_分析报告.html"
-        
-        # 使用Page组件组合所有图表 - 重新组织布局
-        from pyecharts.charts import Page
-        
-        page = Page(layout=Page.SimplePageLayout)
-        
-        # 第一行：2*2图表布局
-        page.add(ic_chart, group_chart, ls_chart, group_bar)
-        
-        # 第二行：行业暴露热力图和风格因子相关系数时序图
-        page.add(barra_style_chart, industry_heatmap)
-        
-        # 第三行：所有数据表
-        page.add(ic_table, stats_table, annual_table)
-        
-        # 保存为HTML文件
         page.render(save_path)
-        
         print(f"HTML报告已保存到: {save_path}")
-        
-        # 默认显示HTML文件
+
         import webbrowser
         webbrowser.open(save_path)
-        
         return page
 
     def generate_report(self, n_groups=10, method='spearman', save_path=None, show_log_returns=True):
-        """生成分析报告"""
+        """命令行版打印 + 生成HTML"""
         print("=" * 50)
         print(f"因子分析报告: {self.factor_name}")
         print(f"调仓周期: {self.rebalance_period}")
         print("=" * 50)
-        
-        ic_stats = self.calculate_icir(method)
+
+        # 交易层
+        pos_ret = self.compute_positions_and_returns(n_groups=n_groups)
+        # 绩效层
+        perf = self.analyze_performance(pos_ret, method=method, n_groups=n_groups)
+        ic_stats = perf['ic_stats']
+        ls_stats = perf['long_short']['stats']
+
         print(f"\nIC分析结果 ({method}相关系数):")
         
-        # 显示IC1到IC5的统计信息
-        for lag in range(1, 6):
-            ic_key = f'IC{lag}'
-            if ic_key in ic_stats:
-                ic_data = ic_stats[ic_key]
-                print(f"\n{ic_key}:")
-                print(f"  IC均值: {ic_data['IC_mean']:.4f}")
-                print(f"  IC标准差: {ic_data['IC_std']:.4f}")
-                print(f"  ICIR: {ic_data['ICIR']:.4f}")
-                print(f"  IC正比例: {ic_data['IC_positive_ratio']:.2%}")
-                print(f"  IC偏度: {ic_data['IC_skew']:.4f}")
-                print(f"  IC峰度: {ic_data['IC_kurtosis']:.4f}")
-                print(f"  t值: {ic_data['IC_tvalue']:.4f}")
-                print(f"  p值: {ic_data['IC_pvalue']:.4g}")
+        # 创建IC统计指标DataFrame
+        ic_df_data = []
+        metrics = [
+            ("IC均值", "IC_mean", ":.4f"),
+            ("IC标准差", "IC_std", ":.4f"),
+            ("ICIR", "ICIR", ":.4f"),
+            ("IC正比例", "IC_positive_ratio", ":.2%"),
+            ("IC偏度", "IC_skew", ":.4f"),
+            ("IC峰度", "IC_kurtosis", ":.4f"),
+            ("t值", "IC_tvalue", ":.4f"),
+            ("p值", "IC_pvalue", ":.4g")
+        ]
+        
+        # 构建DataFrame数据
+        ic_keys = [k for k in ic_stats.keys() if k != 'IC_series']
+        for metric_name, metric_key, fmt in metrics:
+            row = {'指标': metric_name}
+            for ic_key in ic_keys:
+                dat = ic_stats.get(ic_key, {})
+                val = dat.get(metric_key, np.nan)
+                if pd.isna(val):
+                    row[ic_key] = "NaN"
+                else:
+                    if fmt == ":.2%":
+                        row[ic_key] = f"{val:.2%}"
+                    elif fmt == ":.4g":
+                        row[ic_key] = f"{val:.4g}"
+                    else:
+                        row[ic_key] = f"{val:.4f}"
+            ic_df_data.append(row)
+        
+        # 创建并打印IC统计DataFrame
+        ic_df = pd.DataFrame(ic_df_data)
+        ic_df = ic_df.set_index('指标')
+        print("\n" + "="*80)
+        print("IC统计指标汇总表")
+        print("="*80)
+        print(ic_df.to_string())
+        print("="*80)
+        
 
-        returns_data = self.calculate_returns(n_groups)
-        long_short_data = returns_data['long_short_returns']
-        stats = long_short_data['stats']
-        
+
         print(f"\n多空组合分析结果 ({n_groups}分组):")
-        print(f"平均收益: {stats['mean_return']:.4f}")
-        print(f"收益率标准差: {stats['std_return']:.4f}")
-        print(f"夏普比率: {stats['sharpe_ratio']:.4f}")
-        print(f"胜率: {stats['win_rate']:.2%}")
-        print(f"最大回撤: {stats['max_drawdown']:.2%}")
-        print(f"总收益: {stats['total_return']:.2%}")
-        
-        # 准备预计算数据
+        print(f"  平均收益: {ls_stats['mean_return']:.4f}")
+        print(f"  收益率标准差: {ls_stats['std_return']:.4f}")
+        print(f"  夏普比率: {ls_stats['sharpe_ratio']:.4f}")
+        print(f"  胜率: {ls_stats['win_rate']:.2%}")
+        print(f"  最大回撤: {ls_stats['max_drawdown']:.2%}")
+        print(f"  总收益: {ls_stats['total_return']:.2%}")
+        print(f"  年化收益: {ls_stats['annualized_return']:.2%}")
+
+        # 生成可视化报告
         precomputed_data = {
             'ic_stats': ic_stats,
             'ic_series': ic_stats['IC_series'],
-            'group_returns': returns_data['group_returns'],
-            'cumulative_returns': returns_data['cumulative_returns'],
-            'long_short_returns': long_short_data,
-            'long_short_stats': stats,
-            'barra_style_corr': None,
-            'barra_industry_exposure': None
+            'group_returns': {'group_returns': pos_ret['group_daily_returns']},
+            'cumulative_returns': pos_ret['group_cum_nav'],
+            'long_short_returns': perf['long_short'],
+            'long_short_stats': ls_stats,
+            'annual_df': perf['annual_df'],
+            'barra_all': self.barra_analysis(pos_ret, n_groups=n_groups)
         }
-
-        self.plot_full_analysis(method=method, n_groups=n_groups, precomputed_data=precomputed_data, save_path=save_path, show_log_returns=show_log_returns)
+        self.plot_full_analysis(method=method, n_groups=n_groups,
+                                precomputed_data=precomputed_data,
+                                save_path=save_path, show_log_returns=show_log_returns)
 
         return {
             'ic_stats': ic_stats,
-            'long_short_stats': stats,
-            'group_returns': returns_data['group_returns'],
-            'cumulative_returns': returns_data['cumulative_returns'],
-            'long_short_returns': long_short_data
+            'long_short_stats': ls_stats,
+            'group_returns': {'group_returns': pos_ret['group_daily_returns']},
+            'cumulative_returns': pos_ret['group_cum_nav'],
+            'long_short_returns': perf['long_short']
         }
 
 
-def analyze_single_factor(factor_data, returns_data, factor_name='factor', n_groups=10, method='spearman', rebalance_period=1, enable_stock_filter=True, save_path=None, show_log_returns=True, barra_data=None):
-    """单因子分析主函数"""
-    analyzer = SingleFactorAnalyzer(factor_data, returns_data, factor_name, rebalance_period, enable_stock_filter, barra_data)
-    return analyzer.generate_report(n_groups, method, save_path, show_log_returns)
+def analyze_single_factor(factor_data, returns_data, factor_name='factor',
+                          n_groups=10, method='spearman', rebalance_period=1,
+                          enable_stock_filter=True, save_path=None,
+                          show_log_returns=True, barra_data=None):
+
+    analyzer = SingleFactorAnalyzer(
+        factor_data=factor_data,
+        returns_data=returns_data,
+        factor_name=factor_name,
+        rebalance_period=rebalance_period,
+        enable_stock_filter=enable_stock_filter,
+        barra_data=barra_data
+    )
+    return analyzer.generate_report(n_groups=n_groups, method=method,
+                                    save_path=save_path, show_log_returns=show_log_returns)

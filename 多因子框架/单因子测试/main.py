@@ -162,32 +162,7 @@ def run_single_factor_analysis(factor_name,rebalance_period):
         cumulative_ls_returns = results['long_short_returns']['cumulative_ls_returns']
         cumulative_ls_returns.to_csv(os.path.join(output_dir, f"{factor_name}_cumulative_ls_returns.csv"))
 
-        # 打印结果摘要
-        print(f"\n=== {factor_name} 因子分析结果摘要 ===")
-        print(f"IC统计:")
-        
-        # 显示IC1到IC5的统计信息
-        for lag in range(1, 6):
-            ic_key = f'IC{lag}'
-            if ic_key in ic_stats:
-                ic_data = ic_stats[ic_key]
-                print(f"\n{ic_key}:")
-                print(f"  IC均值: {ic_data['IC_mean']:.4f}")
-                print(f"  IC标准差: {ic_data['IC_std']:.4f}")
-                print(f"  ICIR: {ic_data['ICIR']:.4f}")
-                print(f"  IC正比例: {ic_data['IC_positive_ratio']:.2%}")
-                print(f"  IC偏度: {ic_data['IC_skew']:.4f}")
-                print(f"  IC峰度: {ic_data['IC_kurtosis']:.4f}")
-                print(f"  t值: {ic_data['IC_tvalue']:.4f}")
-                print(f"  p值: {ic_data['IC_pvalue']:.4g}")
-        
-        print(f"\n多空组合统计:")
-        print(f"  平均收益: {long_short_stats['mean_return']:.4f}")
-        print(f"  收益率标准差: {long_short_stats['std_return']:.4f}")
-        print(f"  夏普比率: {long_short_stats['sharpe_ratio']:.4f}")
-        print(f"  胜率: {long_short_stats['win_rate']:.2%}")
-        print(f"  最大回撤: {long_short_stats['max_drawdown']:.2%}")
-        print(f"  总收益: {long_short_stats['total_return']:.2%}")
+
 
 
 
@@ -211,4 +186,5 @@ def main(factor_name,rebalance_period):
         run_single_factor_analysis(factor_name,rebalance_period)
 
 if __name__ == "__main__":
-    main(factor_name='residual_5day_all_factor',rebalance_period = 1)
+    #main(factor_name='residual_5day_all_factor',rebalance_period = 5)
+    main(factor_name= None,rebalance_period = 1)
