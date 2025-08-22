@@ -32,7 +32,8 @@ class SingleFactorAnalyzer:
         self.factor_name = factor_name
         self.rebalance_period = rebalance_period
         self.enable_stock_filter = bool(enable_stock_filter)
-        self.barra_data = barra_data.copy() if barra_data is not None else None
+        # 避免复制barra_data，直接使用引用，在需要时再处理
+        self.barra_data = barra_data  # 移除.copy()操作
         # 缓存IC统计结果，避免重复计算
         self._ic_stats_cache = {}
         print("  [初始化层] 读取因子数据与行情数据 ...")
@@ -109,45 +110,26 @@ class SingleFactorAnalyzer:
 
     def compute_positions_and_returns(self, n_groups=10):
         """
-        交易层主函数：
-        1) 仅在调仓日做分组（非停牌/非ST/非涨停）
-        2) 利用 merge_asof 将“最近一次调仓结果”映射到每个交易日，形成每日持仓（非调仓日继承）
-        3) 与行情合并，计算每日各组等权收益；给出各组累计净值
-        返回：
-        {
-            'positions_daily': DataFrame[date, rb_date, order_book_id, group],
-            'group_daily_returns': DataFrame(index=date, columns=0..n_groups-1),
-            'group_cum_nav': DataFrame(index=date, columns=0..n_groups-1),
-            'rebalance_info': {
-                'rebalance_dates': list,
-                'group_labels_rebalance': DataFrame[rb_date, order_book_id, group]
-            }
-        }
+        交易层主函数（交易日循环 + 组间向量化 + 对齐安全）：
+        - 初始虚拟总市值=1
+        - 调仓日：上一日组总市值等权分配
+        - 非调仓日：滚动市值 * (1+当日收益)
+        - 输出：每日持仓、分组收益率、累计净值
         """
+        import pandas as pd
+        import numpy as np
+
         print(f"  [交易层] 构建调仓分组与每日持仓 (n_groups={n_groups}, 周期={self.rebalance_period}) ...")
 
-        if len(self.rebalance_dates) == 0:
-            empty = pd.DataFrame(columns=['date', 'rb_date', 'order_book_id', 'group'])
-            idx = pd.DatetimeIndex([])
-            grp = pd.DataFrame(index=idx, columns=range(n_groups))
-            return {
-                'positions_daily': empty,
-                'group_daily_returns': grp,
-                'group_cum_nav': grp,
-                'rebalance_info': {'rebalance_dates': [], 'group_labels_rebalance': empty}
-            }
-
-        # 仅在调仓日分组
-        md = self.merged_data.copy()
-
-        # 关键：将收益率shift(-1)，使得持有期收益为“买入当日持有到下一交易日”的收益
-        md = md.sort_values(['order_book_id', 'date'])
+        # -------- A. 数据准备 --------
+        md = self.merged_data.sort_values(['order_book_id', 'date']).copy()
         md['future_return'] = md.groupby('order_book_id')['return'].shift(-1)
 
-        rb_set = set(self.rebalance_dates)
-        df_rb = md[md['date'].isin(rb_set)].copy()
+        rb_dates = pd.to_datetime(self.rebalance_dates)
+        rb_set = set(rb_dates)
 
-        # 按调仓日分组，批量生成分组
+        # 调仓日分组
+        df_rb = md[md['date'].isin(rb_set)].copy()
         group_labels_list = []
         for d, g in df_rb.groupby('date'):
             res = self._make_groups_on_rebalance_day(g, n_groups)
@@ -155,71 +137,93 @@ class SingleFactorAnalyzer:
                 group_labels_list.append(res)
 
         if not group_labels_list:
-            empty = pd.DataFrame(columns=['date', 'rb_date', 'order_book_id', 'group'])
+            empty = pd.DataFrame(columns=['date', 'rb_date', 'order_book_id', 'group', 'weight', 'market_value'])
             idx = pd.DatetimeIndex([])
             grp = pd.DataFrame(index=idx, columns=range(n_groups))
             return {
                 'positions_daily': empty,
                 'group_daily_returns': grp,
                 'group_cum_nav': grp,
-                'rebalance_info': {'rebalance_dates': self.rebalance_dates, 'group_labels_rebalance': empty}
+                'rebalance_info': {'rebalance_dates': list(rb_dates), 'group_labels_rebalance': empty}
             }
 
         group_labels_rebalance = pd.concat(group_labels_list, ignore_index=True)
+        group_labels_rebalance['rb_date'] = pd.to_datetime(group_labels_rebalance['rb_date'])
 
-        # 将每个交易日映射到“最近一次调仓日”
+        # -------- B. 构建每日持仓框架 --------
         all_dates = np.sort(md['date'].unique())
         dates_df = pd.DataFrame({'date': pd.to_datetime(all_dates)}).sort_values('date')
-        rb_df = pd.DataFrame({'rb_date': pd.to_datetime(self.rebalance_dates)}).sort_values('rb_date')
+        rb_df = pd.DataFrame({'rb_date': pd.to_datetime(rb_dates)}).sort_values('rb_date')
+        map_df = pd.merge_asof(dates_df, rb_df, left_on='date', right_on='rb_date', direction='backward')
+        map_df = map_df[map_df['rb_date'].notna()]
+        positions_daily = map_df.merge(group_labels_rebalance, how='left', on='rb_date')[['date','rb_date','order_book_id','group']]
+        positions_daily = positions_daily.merge(
+            md[['date','order_book_id','future_return']],
+            on=['date','order_book_id'], how='left'
+        ).rename(columns={'future_return':'return'})
 
-        # merge_asof 找最近不超过 date 的 rb_date
-        map_df = pd.merge_asof(
-            dates_df.rename(columns={'date': 'key'}),
-            rb_df.rename(columns={'rb_date': 'key'}),
-            on='key', direction='backward'
-        ).rename(columns={'key': 'date', 'key_y': 'rb_date'}).drop(columns=['rb_date'], errors='ignore')
+        positions_daily['market_value'] = 0.0
+        positions_daily['weight'] = 0.0
 
-        # 注意：上面的 asof 会把匹配的列名放回第2列，直接再合并一次获取 rb_date
-        map_df = pd.merge_asof(
-            dates_df, rb_df, left_on='date', right_on='rb_date', direction='backward'
-        )
+        # -------- C. 初始化组总市值 --------
+        group_cum_nav = pd.DataFrame(index=all_dates, columns=range(n_groups), dtype=float)
+        group_cum_nav.iloc[0,:] = 1.0  # 初始组总市值=1
 
-        # positions_daily = 对每个 date，拿到对应 rb_date 的分组
-        positions_daily = map_df.merge(
-            group_labels_rebalance, how='left', on='rb_date'
-        )[['date', 'rb_date', 'order_book_id', 'group']]
+        # -------- D. 交易日循环 --------
+        from tqdm import tqdm
+        for i, date in enumerate(tqdm(all_dates, desc="交易日循环")):
+            today_mask = positions_daily['date'] == date
+            rb_today = date in rb_set
 
-        # 用 future_return 替换原有的 return，确保是“买入当日持有到下一交易日”的收益
-        pr = positions_daily.merge(
-            md[['date', 'order_book_id', 'future_return']],
-            on=['date', 'order_book_id'], how='left'
-        ).rename(columns={'future_return': 'return'})
+            today_df = positions_daily.loc[today_mask].copy()
+            group_counts = today_df.groupby('group')['order_book_id'].transform('count')
 
-        # groupby mean（自动忽略NaN收益）
-        group_daily_returns = (
-            pr.groupby(['date', 'group'])['return']
-              .mean()
-              .unstack('group')
-              .reindex(columns=range(n_groups))
-              .sort_index()
-        )
+            if rb_today:
+                # 调仓日：上一日组总市值 / 成分股数量
+                if i == 0:
+                    prev_group_values = np.ones(n_groups)
+                else:
+                    prev_group_values = group_cum_nav.iloc[i-1].values
+                prev_values_map = pd.Series(prev_group_values, index=range(n_groups))
+                init_values = prev_values_map.loc[today_df['group']].values / group_counts.values
+                positions_daily.loc[today_mask, 'market_value'] = init_values
+            else:
+                # 非调仓日：昨日市值 * (1+当日收益)
+                prev_date = all_dates[i-1]
 
-        # 累计净值（从1开始）
-        # 注意：这里使用的是日收益率，累计净值会增长很快
-        # 如果需要年化收益率，应该使用 (1 + daily_return).cumprod() ** (252/len(daily_return)) - 1
-        group_cum_nav = (1 + group_daily_returns.fillna(0)).cumprod()
+                # 上一日市值
+                prev_df = positions_daily.loc[positions_daily['date']==prev_date, ['order_book_id','group','market_value']]
+                prev_df = prev_df.set_index(['order_book_id','group'])
 
-        print(f"  [交易层] 已生成每日持仓 {len(positions_daily):,} 行；交易日 {group_daily_returns.shape[0]} 天。")
+                # 当日收益
+                returns_today = positions_daily.loc[today_mask, ['order_book_id','group','return']]
+                returns_today = returns_today.set_index(['order_book_id','group'])
+
+                # 对齐索引后相乘，保证长度一致
+                mv_today = prev_df['market_value'].reindex(returns_today.index) * (1 + returns_today['return'])
+                positions_daily.loc[today_mask, 'market_value'] = mv_today.values
+
+            # 更新组总市值（向量化）
+            group_cum_nav.loc[date] = positions_daily.loc[today_mask].groupby('group')['market_value'].sum()
+
+            # 更新权重
+            total_map = positions_daily.loc[today_mask].groupby('group')['market_value'].transform('sum')
+            positions_daily.loc[today_mask, 'weight'] = positions_daily.loc[today_mask,'market_value'] / total_map
+
+        # -------- E. 组收益率 --------
+        group_daily_returns = group_cum_nav.pct_change().fillna(0)
 
         return {
             'positions_daily': positions_daily,
             'group_daily_returns': group_daily_returns,
             'group_cum_nav': group_cum_nav,
             'rebalance_info': {
-                'rebalance_dates': self.rebalance_dates,
+                'rebalance_dates': list(rb_dates),
                 'group_labels_rebalance': group_labels_rebalance
             }
         }
+
+
 
     # ============== 绩效层：IC/ICIR + 多空统计 ==============
     def compute_ic_and_stats(self, method='spearman', max_lag=5):
@@ -423,7 +427,7 @@ class SingleFactorAnalyzer:
         """
         将 Barra 相关的计算统一在一个函数中：
         1) 风格因子相关性：factor_value 与 11个风格因子的日度相关 & 20日滚动均值
-        2) 行业暴露差异：使用“每日持仓”计算 long vs short 的行业暴露差异，并给出季度平均
+        2) 行业暴露差异：使用"每日持仓"计算 long vs short 的行业暴露差异，并给出季度平均
 
         返回：
         {
@@ -446,7 +450,7 @@ class SingleFactorAnalyzer:
 
         print("  [Barra] 计算风格相关性与行业暴露差异 ...")
 
-        # ---- 风格因子相关性（与原始实现一致，彻底向量化） ----
+        # ---- 风格因子相关性（使用斯皮尔曼相关系数，彻底向量化） ----
         barra_columns = self.barra_data.columns.tolist()
         style_factors = [c for c in barra_columns if c not in ['date', 'order_book_id']][:11]
 
@@ -462,24 +466,24 @@ class SingleFactorAnalyzer:
 
         T, N = X.shape
         K = Y.shape[2]
-        mask_x = ~np.isnan(X)
-        mask_y = ~np.isnan(Y)
-        mask = mask_x[:, :, None] & mask_y
-
-        Xc = np.where(mask, X[:, :, None], np.nan)
-        Yc = np.where(mask, Y, np.nan)
-
-        mean_x = np.nanmean(Xc, axis=1, keepdims=True)
-        mean_y = np.nanmean(Yc, axis=1, keepdims=True)
-        Xc -= mean_x
-        Yc -= mean_y
-
-        cov = np.nansum(Xc * Yc, axis=1)      # T×K
-        var_x = np.nansum(Xc ** 2, axis=1)    # T×K
-        var_y = np.nansum(Yc ** 2, axis=1)    # T×K
-        corr = cov / np.sqrt(var_x * var_y)
-        valid_cnt = np.sum(mask, axis=1)      # T×K
-        corr[valid_cnt < 10] = np.nan
+        
+        # 使用斯皮尔曼相关系数计算
+        corr = np.full((T, K), np.nan)
+        for t in range(T):
+            for k in range(K):
+                x_t = X[t, :]
+                y_t = Y[t, :, k]
+                # 找到非NaN的索引
+                valid_mask = ~(np.isnan(x_t) | np.isnan(y_t))
+                if np.sum(valid_mask) >= 10:  # 至少需要10个有效值
+                    x_valid = x_t[valid_mask]
+                    y_valid = y_t[valid_mask]
+                    try:
+                        # 计算斯皮尔曼相关系数
+                        corr_coef, _ = stats.spearmanr(x_valid, y_valid, nan_policy='omit')
+                        corr[t, k] = corr_coef
+                    except:
+                        corr[t, k] = np.nan
 
         daily_corr = pd.DataFrame(corr, index=factor_wide.index, columns=style_factors)
         rolling_corr = daily_corr.rolling(window=20, min_periods=5).mean()
@@ -490,7 +494,7 @@ class SingleFactorAnalyzer:
             'style_factors': style_factors
         }
 
-        # ---- 行业暴露差异：使用每日持仓 ----
+        # ---- 行业暴露差异：使用每日持仓，优化内存使用 ----
         industry_factors = [c for c in barra_columns if c not in ['date', 'order_book_id']][-31:]
         pos_daily = positions_returns['positions_daily']  # date, rb_date, order_book_id, group
 
@@ -504,31 +508,81 @@ class SingleFactorAnalyzer:
             }
             return {'style_correlation': style_pack, 'industry_exposure': industry_pack}
 
-        # 合并持仓与行业暴露
-        barra_use = self.barra_data[['date', 'order_book_id'] + industry_factors].copy()
-        merged = pos_daily.merge(barra_use, on=['date', 'order_book_id'], how='left')
-
-        exp_daily = merged.groupby(['date', 'group'])[industry_factors].mean()  # 每日分组平均暴露
-        # 多空分组：与绩效处一致（用IC方向）
+        # 内存优化：分批处理行业因子，避免一次性加载所有数据
+        print(f"    [Barra] 处理 {len(industry_factors)} 个行业因子，优化内存使用...")
+        
+        # 获取多空分组信息
         ic_stats = self.compute_ic_and_stats()
         first_ic_key = [k for k in ic_stats.keys() if k != 'IC_series'][0]
         ic_mean = ic_stats[first_ic_key]['IC_mean']
-        long_group, short_group = (len(industry_factors) - 1, 0)
-        # 注意：上行错误。应按 n_groups 决定
-        n_groups = merged['group'].dropna().astype(int).max() + 1 if merged['group'].notna().any() else 10
+        
+        # 获取实际的n_groups数量
+        actual_n_groups = pos_daily['group'].dropna().astype(int).max() + 1 if pos_daily['group'].notna().any() else n_groups
+        
         if pd.isna(ic_mean) or ic_mean >= 0:
-            long_group, short_group = n_groups - 1, 0
+            long_group, short_group = actual_n_groups - 1, 0
         else:
-            long_group, short_group = 0, n_groups - 1
+            long_group, short_group = 0, actual_n_groups - 1
 
-        if (long_group in exp_daily.index.get_level_values('group')) and (short_group in exp_daily.index.get_level_values('group')):
-            long_exposure = exp_daily.xs(long_group, level='group')
-            short_exposure = exp_daily.xs(short_group, level='group')
-            exposure_diff = long_exposure - short_exposure
+        # 分批处理行业因子，避免内存溢出
+        batch_size = 5  # 每次处理5个因子
+        long_exposure_list = []
+        short_exposure_list = []
+        
+        for i in range(0, len(industry_factors), batch_size):
+            batch_factors = industry_factors[i:i+batch_size]
+            print(f"      [Barra] 处理行业因子批次 {i//batch_size + 1}/{(len(industry_factors)-1)//batch_size + 1}: {batch_factors}")
+            
+            # 只选择当前批次的因子列
+            barra_batch = self.barra_data[['date', 'order_book_id'] + batch_factors].copy()
+            
+            # 使用更高效的merge策略：先过滤pos_daily中实际存在的股票
+            unique_stocks = pos_daily['order_book_id'].unique()
+            barra_filtered = barra_batch[barra_batch['order_book_id'].isin(unique_stocks)]
+            
+            # 分批merge，避免内存溢出
+            merged_batch = pos_daily.merge(barra_filtered, on=['date', 'order_book_id'], how='left')
+            
+            # 计算每日分组平均暴露
+            exp_batch = merged_batch.groupby(['date', 'group'])[batch_factors].mean()
+            
+            # 提取多空分组暴露
+            if long_group in exp_batch.index.get_level_values('group'):
+                long_exp_batch = exp_batch.xs(long_group, level='group')[batch_factors]
+                long_exposure_list.append(long_exp_batch)
+            else:
+                # 创建空的DataFrame
+                empty_df = pd.DataFrame(index=merged_batch['date'].unique(), columns=batch_factors)
+                long_exposure_list.append(empty_df)
+                
+            if short_group in exp_batch.index.get_level_values('group'):
+                short_exp_batch = exp_batch.xs(short_group, level='group')[batch_factors]
+                short_exposure_list.append(short_exp_batch)
+            else:
+                # 创建空的DataFrame
+                empty_df = pd.DataFrame(index=merged_batch['date'].unique(), columns=batch_factors)
+                short_exposure_list.append(empty_df)
+            
+            # 清理内存
+            del barra_batch, barra_filtered, merged_batch, exp_batch
+        
+        # 合并所有批次的结果
+        if long_exposure_list:
+            long_exposure = pd.concat(long_exposure_list, axis=1)
+            # 处理重复的日期索引
+            long_exposure = long_exposure.groupby(level=0).first()
         else:
             long_exposure = pd.DataFrame(columns=industry_factors)
+            
+        if short_exposure_list:
+            short_exposure = pd.concat(short_exposure_list, axis=1)
+            # 处理重复的日期索引
+            short_exposure = short_exposure.groupby(level=0).first()
+        else:
             short_exposure = pd.DataFrame(columns=industry_factors)
-            exposure_diff = pd.DataFrame(columns=industry_factors)
+        
+        # 计算暴露差异
+        exposure_diff = long_exposure - short_exposure
 
         # 季度统计
         for df in [long_exposure, short_exposure, exposure_diff]:
@@ -779,6 +833,15 @@ class SingleFactorAnalyzer:
                     year = idx.year
                     quarter = (idx.month - 1) // 3 + 1
                     time_labels.append(f"{year}Q{quarter}")
+                
+                # 优化行业标签显示：截断过长的标签，添加省略号
+                industry_labels = []
+                for ind in quarter_diff.columns:
+                    if len(ind) > 15:
+                        industry_labels.append(ind[:12] + "...")
+                    else:
+                        industry_labels.append(ind)
+                
                 for i, _t in enumerate(quarter_diff.index):
                     for j, ind in enumerate(quarter_diff.columns):
                         v = quarter_diff.loc[_t, ind]
@@ -793,24 +856,44 @@ class SingleFactorAnalyzer:
                 else:
                     color_range = 0.01
 
+                # 根据行业数量调整图表高度
+                n_industries = len(industry_labels)
+                chart_height = max(400, min(800, n_industries * 20 + 200))  # 动态高度
+
                 industry_heatmap = (
                     HeatMap()
                     .add_xaxis(time_labels)
-                    .add_yaxis("行业因子", list(quarter_diff.columns), heatmap_data,
-                               label_opts=opts.LabelOpts(is_show=False))
+                    .add_yaxis("行业因子", industry_labels, heatmap_data,
+                            label_opts=opts.LabelOpts(is_show=True, font_size=10, position="right"))
                     .set_global_opts(
                         title_opts=opts.TitleOpts(title=f"{self.factor_name} - 行业因子多空暴露差异（季度统计）"),
                         xaxis_opts=opts.AxisOpts(type_="category", axislabel_opts=opts.LabelOpts(rotate=45)),
-                        yaxis_opts=opts.AxisOpts(type_="category"),
+                        yaxis_opts=opts.AxisOpts(type_="category",
+                                                axislabel_opts=opts.LabelOpts(font_size=10, rotate=0)),
+                        datazoom_opts=[
+                            # X轴滑块（横向）
+                            opts.DataZoomOpts(type_="slider", orient="horizontal", xaxis_index=0,
+                                            range_start=0, range_end=100, pos_bottom="5%"),
+                            # Y轴滑块（纵向）
+                            opts.DataZoomOpts(type_="slider", orient="vertical", yaxis_index=0,
+                                            range_start=0, range_end=100, pos_left="left"),
+                            # 内部缩放：支持鼠标操作
+                            opts.DataZoomOpts(type_="inside", xaxis_index=0),
+                            opts.DataZoomOpts(type_="inside", yaxis_index=0)
+                        ],
                         visualmap_opts=opts.VisualMapOpts(
                             min_=-color_range, max_=color_range, pos_left="right",
                             is_calculable=True, split_number=10,
-                            range_color=["#0000FF", "#FFFFFF", "#FF0000"]  # 蓝色(负值) -> 白色(0) -> 红色(正值)
+                            range_color=["#0000FF", "#FFFFFF", "#FF0000"]
                         )
+                    )
+                    .set_series_opts(
+                        label_opts=opts.LabelOpts(is_show=False, font_size=8, position="inside")
                     )
                 )
         if industry_heatmap is not None:
             page.add(industry_heatmap)
+
 
         # 9) 数据表部分（第四行）
         from pyecharts.components import Table

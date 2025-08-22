@@ -109,8 +109,33 @@ def init(context):
     cols = ['date', 'order_book_id', 'factor', 'close', 'ST', 'suspended', 'limit_up_flag', 'limit_down_flag']
     
     # 2. 使用更高效的数据加载方式
-    df = pd.read_pickle(
-        r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\测试代码\因子数据\multivariate_rolling_120_复合因子_长数据.pkl"
+    # 读取行情数据（长数据）
+    market_df = pd.read_pickle(
+        r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\多因子框架\行情数据库\data.pkl"
+    )
+
+    # 读取因子数据（宽数据，pb_ttm）
+    factor_wide = pd.read_pickle(
+        r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\多因子框架\因子库\pb_ttm.pkl"
+    )
+
+    # 宽数据转成长数据
+    factor_long = factor_wide.stack().reset_index()
+    factor_long.columns = ['date', 'order_book_id', 'factor']
+    factor_long['factor'] = 1 / factor_long['factor']
+
+    # 确保date为字符串或datetime，order_book_id为字符串
+    factor_long['date'] = pd.to_datetime(factor_long['date'])
+    market_df['date'] = pd.to_datetime(market_df['date'])
+    factor_long['order_book_id'] = factor_long['order_book_id'].astype(str)
+    market_df['order_book_id'] = market_df['order_book_id'].astype(str)
+
+    # 合并（只保留公共部分）
+    df = pd.merge(
+        market_df,
+        factor_long,
+        on=['date', 'order_book_id'],
+        how='inner'
     )
     
     # 3. 只保留需要的列

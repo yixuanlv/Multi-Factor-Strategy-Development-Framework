@@ -187,4 +187,4 @@ def main(factor_name,rebalance_period):
 
 if __name__ == "__main__":
     #main(factor_name='residual_5day_all_factor',rebalance_period = 5)
-    main(factor_name= None,rebalance_period = 1)
+    main(factor_name= 'pb_ttm',rebalance_period = 20)
