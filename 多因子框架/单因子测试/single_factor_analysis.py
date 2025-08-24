@@ -110,119 +110,110 @@ class SingleFactorAnalyzer:
 
     def compute_positions_and_returns(self, n_groups=10):
         """
-        交易层主函数（交易日循环 + 组间向量化 + 对齐安全）：
-        - 初始虚拟总市值=1
-        - 调仓日：上一日组总市值等权分配
-        - 非调仓日：滚动市值 * (1+当日收益)
-        - 输出：每日持仓、分组收益率、累计净值
+        重写版本：简化逻辑，确保收益率计算正确
+        - 每个调仓周期内部，调仓日等权买入
+        - 调仓周期内每日个股市值 = 初始权重 × (1+return).cumprod()
+        - 分组收益率 = 组内股票收益率的加权平均
         """
-        import pandas as pd
-        import numpy as np
+
 
         print(f"  [交易层] 构建调仓分组与每日持仓 (n_groups={n_groups}, 周期={self.rebalance_period}) ...")
 
-        # -------- A. 数据准备 --------
-        md = self.merged_data.sort_values(['order_book_id', 'date']).copy()
+
+        md = self.merged_data.copy().sort_values(['order_book_id', 'date'])
         md['future_return'] = md.groupby('order_book_id')['return'].shift(-1)
 
-        rb_dates = pd.to_datetime(self.rebalance_dates)
-        rb_set = set(rb_dates)
-
         # 调仓日分组
-        df_rb = md[md['date'].isin(rb_set)].copy()
+        df_rb = md[md['date'].isin(self.rebalance_dates)].copy()
         group_labels_list = []
         for d, g in df_rb.groupby('date'):
             res = self._make_groups_on_rebalance_day(g, n_groups)
             if len(res) > 0:
                 group_labels_list.append(res)
 
-        if not group_labels_list:
-            empty = pd.DataFrame(columns=['date', 'rb_date', 'order_book_id', 'group', 'weight', 'market_value'])
-            idx = pd.DatetimeIndex([])
-            grp = pd.DataFrame(index=idx, columns=range(n_groups))
-            return {
-                'positions_daily': empty,
-                'group_daily_returns': grp,
-                'group_cum_nav': grp,
-                'rebalance_info': {'rebalance_dates': list(rb_dates), 'group_labels_rebalance': empty}
-            }
 
         group_labels_rebalance = pd.concat(group_labels_list, ignore_index=True)
-        group_labels_rebalance['rb_date'] = pd.to_datetime(group_labels_rebalance['rb_date'])
 
-        # -------- B. 构建每日持仓框架 --------
+        # 每个交易日映射到最近调仓日
         all_dates = np.sort(md['date'].unique())
-        dates_df = pd.DataFrame({'date': pd.to_datetime(all_dates)}).sort_values('date')
-        rb_df = pd.DataFrame({'rb_date': pd.to_datetime(rb_dates)}).sort_values('rb_date')
+        dates_df = pd.DataFrame({'date': all_dates})
+        rb_df = pd.DataFrame({'rb_date': pd.to_datetime(self.rebalance_dates)})
         map_df = pd.merge_asof(dates_df, rb_df, left_on='date', right_on='rb_date', direction='backward')
-        map_df = map_df[map_df['rb_date'].notna()]
-        positions_daily = map_df.merge(group_labels_rebalance, how='left', on='rb_date')[['date','rb_date','order_book_id','group']]
-        positions_daily = positions_daily.merge(
-            md[['date','order_book_id','future_return']],
-            on=['date','order_book_id'], how='left'
-        ).rename(columns={'future_return':'return'})
+        positions_daily = map_df.merge(group_labels_rebalance, how='left', on='rb_date')
+        positions_daily = positions_daily[['date', 'rb_date', 'order_book_id', 'group']]
 
-        positions_daily['market_value'] = 0.0
-        positions_daily['weight'] = 0.0
+        # 合并未来收益
+        pr = positions_daily.merge(
+            md[['date', 'order_book_id', 'future_return','return']],
+            on=['date', 'order_book_id'], how='left'
+        )
+        pr['group'] = pr['group'].astype(int)
 
-        # -------- C. 初始化组总市值 --------
-        group_cum_nav = pd.DataFrame(index=all_dates, columns=range(n_groups), dtype=float)
-        group_cum_nav.iloc[0,:] = 1.0  # 初始组总市值=1
+        # 确保数据对齐：只保留有分组信息的记录
+        pr = pr.dropna(subset=['group'])
+        
 
-        # -------- D. 交易日循环 --------
-        from tqdm import tqdm
-        for i, date in enumerate(tqdm(all_dates, desc="交易日循环")):
-            today_mask = positions_daily['date'] == date
-            rb_today = date in rb_set
 
-            today_df = positions_daily.loc[today_mask].copy()
-            group_counts = today_df.groupby('group')['order_book_id'].transform('count')
 
-            if rb_today:
-                # 调仓日：上一日组总市值 / 成分股数量
-                if i == 0:
-                    prev_group_values = np.ones(n_groups)
-                else:
-                    prev_group_values = group_cum_nav.iloc[i-1].values
-                prev_values_map = pd.Series(prev_group_values, index=range(n_groups))
-                init_values = prev_values_map.loc[today_df['group']].values / group_counts.values
-                positions_daily.loc[today_mask, 'market_value'] = init_values
-            else:
-                # 非调仓日：昨日市值 * (1+当日收益)
-                prev_date = all_dates[i-1]
 
-                # 上一日市值
-                prev_df = positions_daily.loc[positions_daily['date']==prev_date, ['order_book_id','group','market_value']]
-                prev_df = prev_df.set_index(['order_book_id','group'])
 
-                # 当日收益
-                returns_today = positions_daily.loc[today_mask, ['order_book_id','group','return']]
-                returns_today = returns_today.set_index(['order_book_id','group'])
+        # 计算初始权重（基于调仓日）
+        counts = pr.groupby(['rb_date','group'])['order_book_id'].nunique().rename('n').reset_index()
+        pr = pr.merge(counts, on=['rb_date','group'], how='left')
+        pr['start_weight'] = 1.0 / pr['n']
+        
+                # 计算累计收益
+        pr['gross'] = pr['return'] + 1.0
+        
+        # 处理nan值：将nan替换为1（停牌日收益为0）
+        pr['gross'] = pr['gross'].fillna(1.0)
+        
+        # 计算累计收益
+        pr['stock_cum'] = pr.groupby(['rb_date','group','order_book_id'])['gross'].cumprod()
+        
+        # 计算持仓权重：初始权重 × 累计收益
+        # 对于rb_date==date的部分holding_weight==start_weight，其余为start_weight*stock_cum
+        pr['holding_weight'] = np.where(
+            pr['rb_date'] == pr['date'],
+            pr['start_weight'],
+            pr['start_weight'] * pr['stock_cum']
+        )
+        
+        # 对每个日期每个分组内的持仓权重进行归一化，使其和为1
+        pr['holding_weight'] = pr.groupby(['date','group'])['holding_weight'].transform(lambda x: x / x.sum() if x.sum() != 0 else 0)
+        
+        # 向量化计算分组每日收益率
+        group_returns = pr.groupby(['date', 'group']).apply(
+            lambda x: np.average(x['future_return'], weights=x['holding_weight'])).reset_index()
+        group_returns.columns = ['date', 'group', 'group_return']
+        
+        # 将组收益率合并回原始数据框
+        pr = pr.merge(group_returns, on=['date', 'group'], how='left')
+        
+        # 先去重，只保留每个（date, group）组合的第一条记录，避免pivot时报错
+        pr_nodup = pr.drop_duplicates(subset=['date', 'group'], keep='first')
+        group_daily_returns = pr_nodup.pivot(index='date', columns='group', values='group_return').fillna(0.0)
+        
 
-                # 对齐索引后相乘，保证长度一致
-                mv_today = prev_df['market_value'].reindex(returns_today.index) * (1 + returns_today['return'])
-                positions_daily.loc[today_mask, 'market_value'] = mv_today.values
-
-            # 更新组总市值（向量化）
-            group_cum_nav.loc[date] = positions_daily.loc[today_mask].groupby('group')['market_value'].sum()
-
-            # 更新权重
-            total_map = positions_daily.loc[today_mask].groupby('group')['market_value'].transform('sum')
-            positions_daily.loc[today_mask, 'weight'] = positions_daily.loc[today_mask,'market_value'] / total_map
-
-        # -------- E. 组收益率 --------
-        group_daily_returns = group_cum_nav.pct_change().fillna(0)
+        # 按列排序确保分组顺序一致
+        group_daily_returns = group_daily_returns.reindex(sorted(group_daily_returns.columns), axis=1)
+        
+        # 计算分组累计净值
+        group_cum_nav = (group_daily_returns+1).cumprod()
+        
+        # 确保所有日期都有数据，缺失值用前值填充
+        group_daily_returns = group_daily_returns.reindex(all_dates, method='ffill').fillna(0.0)
+        group_cum_nav = group_cum_nav.reindex(all_dates, method='ffill')
 
         return {
-            'positions_daily': positions_daily,
             'group_daily_returns': group_daily_returns,
             'group_cum_nav': group_cum_nav,
+            'positions_daily': positions_daily,  # 添加每日持仓信息，供barra分析使用
             'rebalance_info': {
-                'rebalance_dates': list(rb_dates),
+                'rebalance_dates': self.rebalance_dates,
                 'group_labels_rebalance': group_labels_rebalance
             }
         }
-
 
 
     # ============== 绩效层：IC/ICIR + 多空统计 ==============
@@ -781,7 +772,7 @@ class SingleFactorAnalyzer:
             .add_yaxis("累计收益率", group_cumulative_last.round(4).tolist(),
                        label_opts=opts.LabelOpts(is_show=False))
             .set_global_opts(
-                title_opts=opts.TitleOpts(title=f"{self.factor_name} - 各分组累计收益率"),
+                title_opts=opts.TitleOpts(title=f"{self.factor_name} - 各分组累计收益率 (因子值越大组数越靠后)"),
                 xaxis_opts=opts.AxisOpts(type_="category"),
                 yaxis_opts=opts.AxisOpts(is_scale=True,
                                          axislabel_opts=opts.LabelOpts(is_show=False),
