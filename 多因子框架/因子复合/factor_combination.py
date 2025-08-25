@@ -86,7 +86,8 @@ class FactorCombiner:
         Parameters
         ----------
         factors : dict[name -> DataFrame]
-            每个因子三列: ['date', 'order_book_id', 'factor_value']
+            每个因子可以是长表格式（三列: ['date', 'order_book_id', 'factor_value']）
+            或宽表格式（索引为日期，列为股票代码，值为因子值）
         prices : DataFrame
             至少三列: ['date', 'order_book_id', 'close']
         rebalance_period : int
@@ -96,185 +97,417 @@ class FactorCombiner:
         self.prices = prices.copy()
         self.rebalance = int(rebalance_period)
 
-        for df in self.factors_raw.values():
-            df['date'] = pd.to_datetime(df['date'])
+        # 检测并处理数据格式
+        self._detect_and_convert_data_format()
+        
+        # 确保价格数据的日期列是datetime格式
         self.prices['date'] = pd.to_datetime(self.prices['date'])
 
         self.factor_names = list(self.factors_raw.keys())
         self._align()
 
+    def _detect_and_convert_data_format(self):
+        """处理因子数据格式，统一为宽表格式"""
+        processed_factors = {}
+        
+        for factor_name, factor_data in self.factors_raw.items():
+            # 检查是否为宽表格式（索引为日期，列为股票代码）
+            if len(factor_data.columns) > 10:
+                # 处理索引：确保是DatetimeIndex且名称为'date'
+                if not isinstance(factor_data.index, pd.DatetimeIndex):
+                    # 尝试将索引转换为DatetimeIndex
+                    try:
+                        factor_data.index = pd.to_datetime(factor_data.index)
+                        
+                    except Exception as e:
+                        continue
+                
+                # 确保索引名称为 'date'
+                if factor_data.index.name != 'date':
+                    factor_data.index.name = 'date'
+                
+                processed_factors[factor_name] = factor_data
+            else:
+                # 如果不是宽表格式，尝试转换为宽表
+                if len(factor_data.columns) == 3:
+                    # 假设是三列的长表格式
+                    col_names = list(factor_data.columns)
+                    date_col = [col for col in col_names if 'date' in col.lower() or col == 'date'][0]
+                    id_col = [col for col in col_names if 'id' in col.lower() or 'code' in col.lower() or col == 'order_book_id'][0]
+                    value_col = [col for col in col_names if col not in [date_col, id_col]][0]
+                    
+                    # 转换为宽表
+                    factor_data = factor_data.set_index(date_col).pivot(columns=id_col, values=value_col)
+                    factor_data.index.name = 'date'
+                    processed_factors[factor_name] = factor_data
+                else:
+                    # 对于行情数据，保持原格式，在_align中处理
+                    processed_factors[factor_name] = factor_data
+        
+        self.factors_raw = processed_factors
+
     # ---- 对齐与宽表 ----
     def _align(self) -> None:
-        # 计算未来收益
-        px = self.prices.sort_values(['order_book_id', 'date'])
-        px['return'] = px.groupby('order_book_id')['close'].pct_change().shift(-self.rebalance)
-        ret = px[['date', 'order_book_id', 'return']].dropna()
-
-        # 将所有因子合并为宽表并求交集（日期x股票）
-        factor_wides = {}
-        for name, f in self.factors_raw.items():
-            df = f[['date', 'order_book_id', 'factor_value']].dropna()
-            wide = df.pivot(index='date', columns='order_book_id', values='factor_value')
-            factor_wides[name] = wide
-        # 收益宽表
-        ret_wide = ret.pivot(index='date', columns='order_book_id', values='return')
-
-        # 求所有矩阵的共同索引/列（严格交集，避免不同维度错配）
-        common_dates = ret_wide.index
-        common_cols = ret_wide.columns
-        for w in factor_wides.values():
-            common_dates = common_dates.intersection(w.index)
-            common_cols = common_cols.intersection(w.columns)
-        # 裁剪
-        self.returns_wide = ret_wide.loc[common_dates, common_cols].sort_index()
-        self.factors_wide = {k: v.loc[common_dates, common_cols].sort_index() for k, v in factor_wides.items()}
+        """数据对齐和预处理"""
+        try:
+            print("开始数据对齐...")
+            print(f"原始价格数据形状: {self.prices.shape}")
+            print(f"原始因子数据: {list(self.factors_raw.keys())}")
+            
+            # 1. 计算未来收益
+            px = self.prices.sort_values(['order_book_id', 'date'])
+            px['return'] = px.groupby('order_book_id')['close'].pct_change(fill_method=None).shift(-self.rebalance)
+            ret = px[['date', 'order_book_id', 'return']].dropna()
+            print(f"未来收益数据形状: {ret.shape}")
+            
+            # 2. 转换为宽表格式
+            ret_wide = ret.pivot(index='date', columns='order_book_id', values='return')
+            print(f"收益宽表形状: {ret_wide.shape}")
+            
+            # 3. 数据对齐（求所有矩阵的共同交集）
+            common_dates = ret_wide.index
+            common_cols = ret_wide.columns
+            
+            # 处理因子数据，确保都是宽表格式
+            processed_factors = {}
+            for name, f in self.factors_raw.items():
+                print(f"处理因子 {name}: 原始形状 {f.shape}")
+                
+                # 如果因子数据是长表格式，转换为宽表
+                if len(f.columns) == 3:
+                    col_names = list(f.columns)
+                    date_col = [col for col in col_names if 'date' in col.lower() or col == 'date'][0]
+                    id_col = [col for col in col_names if 'id' in col.lower() or 'code' in col.lower() or col == 'order_book_id'][0]
+                    value_col = [col for col in col_names if col not in [date_col, id_col]][0]
+                    
+                    print(f"  长表格式: date_col={date_col}, id_col={id_col}, value_col={value_col}")
+                    
+                    # 转换为宽表
+                    f_wide = f.set_index(date_col).pivot(columns=id_col, values=value_col)
+                    f_wide.index.name = 'date'
+                    processed_factors[name] = f_wide
+                    print(f"  转换为宽表后形状: {f_wide.shape}")
+                else:
+                    # 已经是宽表格式
+                    processed_factors[name] = f
+                    print(f"  已经是宽表格式: {f.shape}")
+                
+                # 更新共同交集
+                common_dates = common_dates.intersection(processed_factors[name].index)
+                common_cols = common_cols.intersection(processed_factors[name].columns)
+                print(f"  当前共同交集: 日期={len(common_dates)}, 股票={len(common_cols)}")
+                
+            if len(common_dates) == 0 or len(common_cols) == 0:
+                raise ValueError(f"没有共同的日期或股票: 日期数={len(common_dates)}, 股票数={len(common_cols)}")
+                
+            # 4. 裁剪数据
+            self.returns_wide = ret_wide.loc[common_dates, common_cols].sort_index()
+            self.factors_wide = {k: v.loc[common_dates, common_cols].sort_index() for k, v in processed_factors.items()}
+            self.factor_names = list(self.factors_wide.keys())
+            
+            # 5. 输出最终数据信息
+            print(f"数据对齐完成: {len(common_dates)} 个交易日, {len(common_cols)} 只股票, {len(self.factor_names)} 个因子")
+            print(f"最终收益数据形状: {self.returns_wide.shape}")
+            for name, f in self.factors_wide.items():
+                print(f"  因子 {name} 最终形状: {f.shape}")
+            
+        except Exception as e:
+            print(f"数据对齐失败: {str(e)}")
+            raise
 
     # ---- 日度横截面系数 / IC ----
     def _cs_univariate_beta(self, X: pd.Series, y: pd.Series) -> float:
-        # 输入均为同一日期、同一股票集合的 Series
-        df = pd.concat([X, y], axis=1).dropna()
-        if len(df) < 10:
+        """计算横截面一元回归系数"""
+        # 确保输入数据对齐
+        common_idx = X.index.intersection(y.index)
+        if len(common_idx) < 10:
             return np.nan
-        x = (df.iloc[:, 0].values.reshape(-1, 1) - df.iloc[:, 0].mean()) / (df.iloc[:, 0].std(ddof=0) + 1e-12)
-        model = LinearRegression()
+            
+        x = X.loc[common_idx]
+        y_vals = y.loc[common_idx]
+        
+        # 去除空值
+        valid_mask = x.notna() & y_vals.notna()
+        if valid_mask.sum() < 10:
+            return np.nan
+            
+        x_clean = x[valid_mask]
+        y_clean = y_vals[valid_mask]
+        
+        # 检查数据是否有效
+        if len(x_clean) < 10:
+            return np.nan
+            
+        # 标准化x
+        x_mean = x_clean.mean()
+        x_std = x_clean.std(ddof=0)
+        if x_std == 0:
+            return np.nan
+            
+        x_scaled = (x_clean - x_mean) / x_std
+        
         try:
-            model.fit(x, df.iloc[:, 1].values)
+            model = LinearRegression()
+            model.fit(x_scaled.values.reshape(-1, 1), y_clean.values)
             return float(model.coef_[0])
         except Exception:
             return np.nan
 
     def _cs_multivariate_beta(self, X: pd.DataFrame, y: pd.Series) -> np.ndarray:
-        df = pd.concat([X, y], axis=1).dropna()
-        if len(df) < X.shape[1] + 5:  # 简单的样本量保护
+        """计算横截面多元回归系数"""
+        # 确保输入数据对齐
+        common_idx = X.index.intersection(y.index)
+        if len(common_idx) < X.shape[1] + 5:
             return np.array([np.nan] * X.shape[1])
-        Xv = df.iloc[:, :X.shape[1]].values
-        yv = df.iloc[:, -1].values
-        Xv = StandardScaler().fit_transform(Xv)
+            
+        X_subset = X.loc[common_idx]
+        y_vals = y.loc[common_idx]
+        
+        # 去除空值
+        valid_mask = X_subset.notna().all(axis=1) & y_vals.notna()
+        if valid_mask.sum() < X.shape[1] + 5:
+            return np.array([np.nan] * X.shape[1])
+            
+        X_clean = X_subset[valid_mask]
+        y_clean = y_vals[valid_mask]
+        
+        # 检查数据是否有效
+        if len(X_clean) < X.shape[1] + 5:
+            return np.array([np.nan] * X.shape[1])
+            
+        Xv = X_clean.values
+        yv = y_clean.values
+        
         try:
+            # 标准化X
+            Xv_scaled = StandardScaler().fit_transform(Xv)
             model = LinearRegression()
-            model.fit(Xv, yv)
+            model.fit(Xv_scaled, yv)
             return model.coef_.astype(float)
         except Exception:
             return np.array([np.nan] * X.shape[1])
 
     def _cs_rank_ic(self, X: pd.Series, y: pd.Series) -> float:
-        df = pd.concat([X, y], axis=1).dropna()
-        if len(df) < 10:
+        """计算横截面Rank IC (Spearman相关系数)"""
+        # 确保输入数据对齐
+        common_idx = X.index.intersection(y.index)
+        if len(common_idx) < 10:
             return np.nan
+            
+        x = X.loc[common_idx]
+        y_vals = y.loc[common_idx]
+        
+        # 去除空值
+        valid_mask = x.notna() & y_vals.notna()
+        if valid_mask.sum() < 10:
+            return np.nan
+            
+        x_clean = x[valid_mask]
+        y_clean = y_vals[valid_mask]
+        
+        # 检查数据是否有效
+        if len(x_clean) < 10:
+            return np.nan
+            
+        # 检查是否为常量
+        if x_clean.std(ddof=0) == 0 or y_clean.std(ddof=0) == 0:
+            return np.nan
+            
         try:
-            return float(stats.spearmanr(df.iloc[:, 0], df.iloc[:, 1])[0])
-        except Exception:
+            # 使用rank方法计算Spearman相关系数
+            x_rank = x_clean.rank(method='average')
+            y_rank = y_clean.rank(method='average')
+            
+            # 计算rank相关系数
+            n = len(x_rank)
+            if n < 2:
+                return np.nan
+                
+            # 使用scipy的spearmanr计算
+            corr, _ = stats.spearmanr(x_rank, y_rank)
+            
+            # 调试信息（可选，生产环境可以注释掉）
+            if np.isnan(corr):
+                print(f"Rank IC计算警告: 相关系数为NaN, 数据长度={n}, x_std={x_clean.std():.6f}, y_std={y_clean.std():.6f}")
+            
+            return float(corr) if not np.isnan(corr) else np.nan
+            
+        except Exception as e:
+            print(f"Rank IC计算异常: {str(e)}")
             return np.nan
 
     # ---- 权重时间序列（窗口N的滚动均值） ----
     def _compute_weight_history(self, method: str, N: int) -> pd.DataFrame:
-        dates = self.returns_wide.index
-        stocks = self.returns_wide.columns
+        try:
+            dates = self.returns_wide.index
+            stocks = self.returns_wide.columns
 
-        # 未来收益（与 returns_wide 同索引列）
-        y = self.returns_wide
 
-        # 准备 X: dict[name -> zscored factor]
-        Xz = {k: _zscore_rowwise(v) for k, v in self.factors_wide.items()}
 
-        # 日度原始“指标”
-        raw = []  # list of Series(index=factor_names) per date
+            # 未来收益（与 returns_wide 同索引列）
+            y = self.returns_wide
 
-        if method == 'univariate':
-            for dt in tqdm(dates, desc='univariate betas'):
-                yy = y.loc[dt]
-                vals = {}
-                for fname in self.factor_names:
-                    vals[fname] = self._cs_univariate_beta(Xz[fname].loc[dt], yy)
-                raw.append(pd.Series(vals))
+            # 准备 X: dict[name -> zscored factor]
+            Xz = {k: _zscore_rowwise(v) for k, v in self.factors_wide.items()}
 
-        elif method == 'multivariate':
-            for dt in tqdm(dates, desc='multivariate betas'):
-                yy = y.loc[dt]
-                Xmat = pd.DataFrame({f: Xz[f].loc[dt] for f in self.factor_names})
-                betas = self._cs_multivariate_beta(Xmat, yy)
-                raw.append(pd.Series(betas, index=self.factor_names))
+            # 日度原始"指标"
+            raw = []  # list of Series(index=factor_names) per date
 
-        elif method == 'rank_ic':
-            for dt in tqdm(dates, desc='rank IC'):
-                yy = y.loc[dt]
-                vals = {}
-                for fname in self.factor_names:
-                    vals[fname] = self._cs_rank_ic(Xz[fname].loc[dt], yy)
-                raw.append(pd.Series(vals))
-        else:
-            raise ValueError("method 必须是 {'univariate','multivariate','rank_ic'} 之一")
+            if method == 'univariate':
+                for dt in tqdm(dates, desc='univariate betas'):
+                    try:
+                        yy = y.loc[dt]
+                        vals = {}
+                        for fname in self.factor_names:
+                            if fname in Xz and dt in Xz[fname].index:
+                                vals[fname] = self._cs_univariate_beta(Xz[fname].loc[dt], yy)
+                            else:
+                                vals[fname] = np.nan
+                        raw.append(pd.Series(vals))
+                    except Exception as e:
+                        raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
 
-        raw_df = pd.DataFrame(raw, index=dates)  # (date x factor)
-        # 滚动均值 => 权重历史；再做 L1 归一化
-        weight_hist = raw_df.rolling(N, min_periods=max(5, N//3)).mean().apply(_l1_normalize, axis=1)
-        return weight_hist.fillna(0.0)
+            elif method == 'multivariate':
+                for dt in tqdm(dates, desc='multivariate betas'):
+                    try:
+                        yy = y.loc[dt]
+                        Xmat = pd.DataFrame({f: Xz[f].loc[dt] for f in self.factor_names if f in Xz and dt in Xz[f].index})
+                        if not Xmat.empty and len(Xmat.columns) > 0:
+                            betas = self._cs_multivariate_beta(Xmat, yy)
+                            # 确保返回的betas长度与factor_names一致
+                            if len(betas) == len(self.factor_names):
+                                raw.append(pd.Series(betas, index=self.factor_names))
+                            else:
+                                raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
+                        else:
+                            raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
+                    except Exception as e:
+                        raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
+
+            elif method == 'rank_ic':
+                for dt in tqdm(dates, desc='rank IC'):
+                    try:
+                        yy = y.loc[dt]
+                        vals = {}
+                        for fname in self.factor_names:
+                            if fname in Xz and dt in Xz[fname].index:
+                                vals[fname] = self._cs_rank_ic(Xz[fname].loc[dt], yy)
+                            else:
+                                vals[fname] = np.nan
+                        raw.append(pd.Series(vals))
+                    except Exception as e:
+                        raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
+            else:
+                raise ValueError("method 必须是 {'univariate','multivariate','rank_ic'} 之一")
+
+            if not raw:
+                raise ValueError("没有生成任何权重数据")
+
+            raw_df = pd.DataFrame(raw, index=dates)  # (date x factor)
+            
+            # 滚动均值 => 权重历史；再做 L1 归一化
+            weight_hist = raw_df.rolling(N, min_periods=max(5, N//3)).mean().apply(_l1_normalize, axis=1)
+            return weight_hist.fillna(0.0)
+            
+        except Exception as e:
+            raise
 
     # ---- 生成合成因子与评估 ----
     def build(self, method: str, N: int) -> ComboResult:
-        weight_hist = self._compute_weight_history(method, N)  # (date x factor)
-        # 合成因子：sum_t( w_t[f] * Z(X_f,t) )
-        Z = {k: _zscore_rowwise(v) for k, v in self.factors_wide.items()}
-        # 累加
-        combined = pd.DataFrame(0.0, index=self.returns_wide.index, columns=self.returns_wide.columns)
-        for fname in self.factor_names:
-            w = weight_hist[fname].reindex(combined.index).fillna(0.0)
-            # 每日权重与当日横截面相乘
-            combined += Z[fname].multiply(w, axis=0)
+        try:
+            weight_hist = self._compute_weight_history(method, N)  # (date x factor)
+            
+            # 合成因子：sum_t( w_t[f] * Z(X_f,t) )
+            Z = {k: _zscore_rowwise(v) for k, v in self.factors_wide.items()}
+            
+            # 累加
+            combined = pd.DataFrame(0.0, index=self.returns_wide.index, columns=self.returns_wide.columns)
+            
+            for fname in self.factor_names:
+                if fname in Z and fname in weight_hist.columns:
+                    w = weight_hist[fname].reindex(combined.index).fillna(0.0)
+                    # 每日权重与当日横截面相乘
+                    combined += Z[fname].multiply(w, axis=0)
+            
 
-        # 评估（未来收益采用 rebalance 期）
-        result = self._analyze(combined)
-        return ComboResult(
-            combined_factor=combined,
-            weight_history=weight_hist,
-            ic_series=result['ic_series'],
-            ls_returns=result['long_short_returns'],
-            group_returns=result['group_returns'],
-            summary={k: result[k] for k in ['ic_mean','ic_std','icir','ic_positive_ratio','annual_return','annual_volatility','sharpe_ratio']}
-        )
+
+            # 评估（未来收益采用 rebalance 期）
+            result = self._analyze(combined)
+            return ComboResult(
+                combined_factor=combined,
+                weight_history=weight_hist,
+                ic_series=result['ic_series'],
+                ls_returns=result['long_short_returns'],
+                group_returns=result['group_returns'],
+                summary={k: result[k] for k in ['ic_mean','ic_std','icir','ic_positive_ratio','annual_return','annual_volatility','sharpe_ratio']}
+            )
+            
+        except Exception as e:
+            raise
 
     # ---- 评估 ----
     def _analyze(self, factor: pd.DataFrame) -> dict:
-        # 长表
+        # 长表 - 修复列名问题
         fac_long = factor.stack().rename('factor_value').reset_index()
         ret_long = self.returns_wide.stack().rename('ret').reset_index()
+        
+        # 确保列名正确
+        fac_long.columns = ['date', 'order_book_id', 'factor_value']
+        ret_long.columns = ['date', 'order_book_id', 'ret']
+        
         df = pd.merge(fac_long, ret_long, on=['date','order_book_id'], how='inner')
         # future return 已在 returns_wide 中
         df = df.dropna()
 
         # IC（Spearman）
-        def _ic(g: pd.DataFrame) -> float:
-            x = g['factor_value']
-            y = g['ret']
-            if x.notna().sum() < 10 or y.notna().sum() < 10:
-                return np.nan
-            try:
-                return float(stats.spearmanr(x, y)[0])
-            except Exception:
-                return np.nan
+        ic_series = pd.Series(index=df['date'].unique(), dtype=float)
+        for date in ic_series.index:
+            date_data = df[df['date'] == date]
+            if len(date_data) >= 10:
+                x = date_data['factor_value']
+                y = date_data['ret']
+                
+                # 检查输入数组是否为常量
+                x_vals = x.values
+                y_vals = y.values
+                
+                # 如果任一数组是常量（标准差为0），返回NaN
+                if np.std(x_vals, ddof=0) == 0 or np.std(y_vals, ddof=0) == 0:
+                    ic_series[date] = np.nan
+                    continue
+                    
+                try:
+                    ic_series[date] = float(stats.spearmanr(x, y)[0])
+                except Exception:
+                    ic_series[date] = np.nan
+            else:
+                ic_series[date] = np.nan
 
-        ic_series = df.groupby('date').apply(_ic)
         ic_mean = float(ic_series.mean()) if len(ic_series) else np.nan
         ic_std = float(ic_series.std()) if len(ic_series) else np.nan
         icir = ic_mean / ic_std if (ic_std and ic_std != 0) else np.nan
         ic_pos = float((ic_series > 0).mean()) if len(ic_series) else np.nan
 
         # 分组未来收益（十分位，不足时降级）
-        def _group_for_date(g: pd.DataFrame) -> pd.Series:
-            s = g['factor_value']
+        df['group'] = np.nan
+        for date in df['date'].unique():
+            date_data = df[df['date'] == date]
+            s = date_data['factor_value']
             n = s.notna().sum()
+            
             if n < 10:
-                return pd.Series(index=g.index, dtype=float)
+                continue
+                
             try:
                 q = pd.qcut(s.rank(method='first'), q=min(10, max(2, n//20)), labels=False, duplicates='drop')
+                df.loc[date_data.index, 'group'] = q
             except Exception:
-                q = pd.qcut(s.rank(method='first'), q=2, labels=False, duplicates='drop')
-            out = pd.Series(index=g.index, dtype=float)
-            out.loc[s.index] = q
-            return out
+                try:
+                    q = pd.qcut(s.rank(method='first'), q=2, labels=False, duplicates='drop')
+                    df.loc[date_data.index, 'group'] = q
+                except Exception:
+                    continue
 
-        grp = df.groupby('date').apply(_group_for_date)
-        df['group'] = grp.values
         df = df.dropna(subset=['group'])
         group_ret = df.groupby(['date','group'])['ret'].mean().unstack()
 
@@ -348,7 +581,7 @@ class FactorCombiner:
             if idx_ref is None:
                 idx_ref = s.index
                 line_ic.add_xaxis([d.strftime('%Y-%m-%d') for d in idx_ref])
-            s = s.reindex(idx_ref).fillna(method='ffill').fillna(0)
+            s = s.reindex(idx_ref).ffill().fillna(0)
             line_ic.add_yaxis(m, s.values.tolist(), is_smooth=True, symbol_size=0, label_opts=opts.LabelOpts(is_show=False))
         line_ic.set_global_opts(
             title_opts=opts.TitleOpts(title="累计IC对比"),
@@ -365,7 +598,7 @@ class FactorCombiner:
             if idx_ref is None:
                 idx_ref = s.index
                 line_ls.add_xaxis([d.strftime('%Y-%m-%d') for d in idx_ref])
-            s = s.reindex(idx_ref).fillna(method='ffill').fillna(1)
+            s = s.reindex(idx_ref).ffill().fillna(1)
             line_ls.add_yaxis(m, s.values.tolist(), is_smooth=True, symbol_size=0, label_opts=opts.LabelOpts(is_show=False))
         line_ls.set_global_opts(
             title_opts=opts.TitleOpts(title="多空累计收益对比"),
@@ -414,3 +647,7 @@ class FactorCombiner:
             Table()
             .add(headers=["方法", "IC均值", "ICIR", "IC正比例", "年化收益", "夏普"], rows=rows)
         )
+        page.add(table)
+        
+        # 保存HTML文件
+        page.render(html_path)

@@ -58,9 +58,9 @@ def fast_ic_calculation(factor_values, returns, filter_mask):
 
 class MultiFactorAnalyzer:
     """
-    多因子分析工具类 - 集成多因子测试和共线性分析功能
+    多因子分析工具类 - 集成多因子测试和相关性分析功能
     输入：多个因子数据框的字典，收益率数据框
-    处理：多因子集中测试、共线性分析
+    处理：多因子集中测试、因子相关性分析
     输出：综合多因子分析报表
     """
 
@@ -76,7 +76,7 @@ class MultiFactorAnalyzer:
         self._ic_cache = {}
         self._stats_cache = {}
         self._group_returns_cache = {}
-        self._beta_cache = {}
+        self._correlation_cache = {}
         
         self._align_data()
         
@@ -359,24 +359,7 @@ class MultiFactorAnalyzer:
             
         return group_returns_data
     
-    # ==================== 共线性分析方法 ====================
-    
-    def _calculate_beta_for_date(self, date_data_tuple):
-        """计算单个日期的beta值"""
-        date, date_data = date_data_tuple
-        try:
-            # 应用买入过滤
-            filtered_data = self._filter_tradable_stocks(date_data, for_buy=True)
-            valid_data = filtered_data[['factor_value', 'future_return']].dropna()
-            if len(valid_data) < 10:
-                return date, np.nan
-            X = valid_data['factor_value'].values.reshape(-1, 1)
-            y = valid_data['future_return'].values
-            reg = LinearRegression()
-            reg.fit(X, y)
-            return date, reg.coef_[0]
-        except Exception as e:
-            return date, np.nan
+    # ==================== 因子相关性分析方法 ====================
     
     def _filter_tradable_stocks(self, data, for_buy=True):
         """过滤可交易的股票"""
@@ -389,138 +372,29 @@ class MultiFactorAnalyzer:
         
         return filtered_data
     
-    def calculate_factor_beta(self, factor_name: str) -> pd.Series:
-        """计算单个因子的beta序列"""
-        if factor_name in self._beta_cache:
-            return self._beta_cache[factor_name]
+    def calculate_factor_correlation_matrix(self) -> pd.DataFrame:
+        """计算因子值相关性矩阵 - 简化版本，只计算一个相关性矩阵"""
+        if 'factor_correlation' in self._correlation_cache:
+            return self._correlation_cache['factor_correlation']
         
-        factor_data = self.aligned_factors[factor_name].copy()
-        # 重置索引以获取date列
-        factor_data = factor_data.reset_index()
-        factor_data['future_return'] = factor_data.groupby('order_book_id')['return'].shift(-self.rebalance_period)
-        unique_dates = list(factor_data['date'].unique())
-        date_data_list = []
-        for date in unique_dates:
-            date_data = factor_data[factor_data['date'] == date]
-            date_data_list.append((date, date_data))
+        print("正在计算因子值相关性矩阵...")
         
-        print(f"正在计算 {factor_name} 的beta序列...")
-        results = []
-        for date_data_tuple in tqdm(date_data_list, desc=f"计算{factor_name}的beta序列"):
-            result = self._calculate_beta_for_date(date_data_tuple)
-            results.append(result)
+        # 构建因子值矩阵
+        factor_values_matrix = pd.DataFrame()
         
-        beta_series = pd.Series(index=unique_dates, dtype=float)
-        for date, beta_value in results:
-            beta_series[date] = beta_value
-        
-        self._beta_cache[factor_name] = beta_series
-        return beta_series
-    
-    def calculate_all_factors_beta(self) -> pd.DataFrame:
-        """计算所有因子的beta序列"""
-        print("正在计算所有因子的beta序列...")
-        
-        beta_data = {}
-        for factor_name in tqdm(self.factor_names, desc="计算所有因子的beta序列"):
-            beta_series = self.calculate_factor_beta(factor_name)
-            beta_data[factor_name] = beta_series
+        for factor_name in tqdm(self.factor_names, desc="构建因子值矩阵"):
+            factor_data = self.aligned_factors[factor_name].reset_index()
             
-        return pd.DataFrame(beta_data)
-    
-    def calculate_beta_correlation(self, beta_df: pd.DataFrame) -> pd.DataFrame:
-        """计算因子收益率相关性矩阵"""
-        print("正在计算因子收益率相关性矩阵...")
-        return beta_df.corr(method='pearson')
-    
-    def calculate_factor_correlation_for_date(self, date: pd.Timestamp) -> pd.DataFrame:
-        """计算单个日期的截面因子值相关性矩阵"""
-        factor_data_for_date = {}
-        for factor_name, factor_data in self.aligned_factors.items():
-            # 重置索引以获取date列
-            factor_data_reset = factor_data.reset_index()
-            date_data = factor_data_reset[factor_data_reset['date'] == date]
-            if len(date_data) > 0:
-                filtered_date_data = self._filter_tradable_stocks(date_data, for_buy=True)
-                if len(filtered_date_data) > 0:
-                    stock_factor_map = filtered_date_data.groupby('order_book_id')['factor_value'].first()
-                    factor_data_for_date[factor_name] = stock_factor_map
+            # 获取每个因子的截面因子值，按日期平均
+            factor_pivot = factor_data.pivot(index='date', columns='order_book_id', values='factor_value')
+            # 计算每个日期所有股票因子值的均值，作为该日期的因子代表值
+            factor_values_matrix[factor_name] = factor_pivot.mean(axis=1)
         
-        if len(factor_data_for_date) < 2:
-            return pd.DataFrame()
+        # 计算因子值之间的相关系数矩阵
+        correlation_matrix = factor_values_matrix.corr(method='pearson')
         
-        return pd.DataFrame(factor_data_for_date).corr(method='pearson')
-    
-    def calculate_factor_correlation_series(self) -> Dict[pd.Timestamp, pd.DataFrame]:
-        """计算截面因子值相关性矩阵序列"""
-        print("正在计算截面因子值相关性矩阵序列...")
-        all_dates = set()
-        for factor_data in self.aligned_factors.values():
-            # 重置索引以获取date列
-            factor_data_reset = factor_data.reset_index()
-            all_dates.update(factor_data_reset['date'].unique())
-        common_dates = sorted(list(all_dates))
-        
-        results = []
-        for date in tqdm(common_dates, desc="计算截面相关性"):
-            factor_corr = self.calculate_factor_correlation_for_date(date)
-            results.append(factor_corr)
-        
-        factor_corr_series = {}
-        for date, factor_corr in zip(common_dates, results):
-            if not factor_corr.empty:
-                factor_corr_series[date] = factor_corr
-        
-        return factor_corr_series
-    
-    def calculate_factor_correlation_mean(self, factor_corr_series: Dict[pd.Timestamp, pd.DataFrame]) -> pd.DataFrame:
-        """计算截面因子值相关性矩阵均值"""
-        if not factor_corr_series:
-            return pd.DataFrame()
-        return pd.concat(list(factor_corr_series.values())).groupby(level=0).mean()
-    
-    def _calculate_pair_correlation(self, factor_pair_data):
-        """计算因子对的相关性序列"""
-        factor1, factor2, factor_corr_series = factor_pair_data
-        pair_name = f"{factor1}_{factor2}"
-        corr_data = []
-        dates = []
-        
-        for date, corr_matrix in factor_corr_series.items():
-            if factor1 in corr_matrix.index and factor2 in corr_matrix.columns:
-                corr_value = corr_matrix.loc[factor1, factor2]
-                if not pd.isna(corr_value):
-                    corr_data.append(corr_value)
-                    dates.append(date)
-        
-        return pair_name, pd.Series(corr_data, index=dates) if corr_data else None
-    
-    def calculate_pairwise_correlation_series(self, factor_corr_series: Dict[pd.Timestamp, pd.DataFrame]) -> pd.DataFrame:
-        """计算两两配对因子的相关性序列"""
-        print("正在计算两两配对因子的相关性序列...")
-        if not factor_corr_series:
-            return pd.DataFrame()
-        
-        factor_pairs = list(combinations(self.factor_names, 2))
-        pair_data_list = [(factor1, factor2, factor_corr_series) for factor1, factor2 in factor_pairs]
-        
-        results = []
-        for pair_data in tqdm(pair_data_list, desc="计算因子对相关性序列"):
-            result = self._calculate_pair_correlation(pair_data)
-            results.append(result)
-        
-        pair_corr_data = {}
-        for pair_name, corr_series in results:
-            if corr_series is not None:
-                pair_corr_data[pair_name] = corr_series
-        
-        if pair_corr_data:
-            return pd.DataFrame(pair_corr_data)
-        else:
-            return pd.DataFrame()
-    
-    def calculate_cumulative_correlation(self, corr_df: pd.DataFrame) -> pd.DataFrame:
-        return corr_df.cumsum()
+        self._correlation_cache['factor_correlation'] = correlation_matrix
+        return correlation_matrix
 
     # ==================== 性能计算方法 ====================
     
@@ -620,27 +494,7 @@ class MultiFactorAnalyzer:
             'long_short_data': long_short_data, 'long_excess_data': long_excess_data, 'performance_stats': performance_stats
         }
     
-    def generate_collinearity_report(self, save_path: Optional[str] = None) -> Dict:
-        """生成共线性分析报告"""
-        print("=" * 60)
-        print("多因子共线性分析报告")
-        print(f"调仓周期: {self.rebalance_period}")
-        print("=" * 60)
-        
-        beta_df = self.calculate_all_factors_beta()
-        beta_corr = self.calculate_beta_correlation(beta_df)
-        factor_corr_series = self.calculate_factor_correlation_series()
-        factor_corr_mean = self.calculate_factor_correlation_mean(factor_corr_series)
-        cum_corr_df = self.calculate_pairwise_correlation_series(factor_corr_series)
-        cum_corr_cumsum = self.calculate_cumulative_correlation(cum_corr_df)
-        
-        self.plot_collinearity_analysis(beta_corr, factor_corr_mean, cum_corr_cumsum, save_path)
-        self.print_collinearity_report(beta_corr, factor_corr_mean, cum_corr_df)
-        
-        return {
-            'beta_df': beta_df, 'beta_corr': beta_corr, 'factor_corr_series': factor_corr_series,
-            'factor_corr_mean': factor_corr_mean, 'cum_corr_df': cum_corr_df, 'cum_corr_cumsum': cum_corr_cumsum
-        }
+
     
     # ==================== 图表绘制方法 ====================
     
@@ -678,17 +532,8 @@ class MultiFactorAnalyzer:
         )
         
         # 2. 因子相关系数矩阵热力图
-        # 计算因子值之间的相关系数矩阵
-        factor_values_matrix = pd.DataFrame()
-        for factor_name in self.aligned_factors.keys():
-            factor_data = self.aligned_factors[factor_name].reset_index()
-            # 获取每个因子的截面因子值
-            factor_pivot = factor_data.pivot(index='date', columns='order_book_id', values='factor_value')
-            # 计算因子值的时间序列相关性
-            factor_values_matrix[factor_name] = factor_pivot.mean(axis=1)
-        
-        # 计算因子值之间的相关系数矩阵
-        factor_corr_matrix = factor_values_matrix.corr()
+        # 使用简化的相关性矩阵计算方法
+        factor_corr_matrix = self.calculate_factor_correlation_matrix()
         
         factor_corr_heatmap_data = []
         for i, factor1 in enumerate(factor_corr_matrix.index):
@@ -698,15 +543,15 @@ class MultiFactorAnalyzer:
                     factor_corr_heatmap_data.append([j, i, round(float(value), 4)])
         
         factor_corr_heatmap = (
-                    HeatMap()
+            HeatMap()
             .add_xaxis(list(factor_corr_matrix.columns))
             .add_yaxis("因子", list(factor_corr_matrix.index), factor_corr_heatmap_data,
-                              label_opts=opts.LabelOpts(is_show=False))
-                    .set_global_opts(
+                      label_opts=opts.LabelOpts(is_show=False))
+            .set_global_opts(
                 title_opts=opts.TitleOpts(title="因子值相关系数矩阵", pos_left="center"),
                 xaxis_opts=opts.AxisOpts(name="因子", type_="category"),
                 yaxis_opts=opts.AxisOpts(name="因子", type_="category"),
-                        visualmap_opts=opts.VisualMapOpts(
+                visualmap_opts=opts.VisualMapOpts(
                     min_=factor_corr_matrix.values.min(), max_=factor_corr_matrix.values.max(),
                     pos_left="right", is_calculable=True, precision=4,
                     range_color=["#313695", "#4575b4", "#74add1", "#abd9e9", "#e0f3f8", 
@@ -826,47 +671,47 @@ class MultiFactorAnalyzer:
         if group_cumulative_returns_data:
             for factor_name, cumulative_returns in group_cumulative_returns_data.items():
                 group_chart = Line()
-            n_groups = len(cumulative_returns.columns)
-            
-            for group in range(n_groups):
-                if group in cumulative_returns.columns:
-                    if show_log_returns:
-                        # 使用对数收益率绘制
-                        log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
-                        group_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_returns.index])
-                        group_chart.add_yaxis(f'分组{group+1}', log_returns.round(4).tolist(),
-                                           label_opts=opts.LabelOpts(is_show=False),
-                                           symbol_size=0)
-                    else:
-                        # 使用普通收益率绘制
-                        group_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_returns.index])
-                        group_chart.add_yaxis(f'分组{group+1}', cumulative_returns[group].round(4).tolist(),
-                                           label_opts=opts.LabelOpts(is_show=False),
-                                           symbol_size=0)
-            
-            if show_log_returns:
+                n_groups = len(cumulative_returns.columns)
+                
+                for group in range(n_groups):
+                    if group in cumulative_returns.columns:
+                        if show_log_returns:
+                            # 使用对数收益率绘制
+                            log_returns = np.log10(cumulative_returns[group].replace(0, np.nan))
+                            group_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_returns.index])
+                            group_chart.add_yaxis(f'分组{group+1}', log_returns.round(4).tolist(),
+                                               label_opts=opts.LabelOpts(is_show=False),
+                                               symbol_size=0)
+                        else:
+                            # 使用普通收益率绘制
+                            group_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in cumulative_returns.index])
+                            group_chart.add_yaxis(f'分组{group+1}', cumulative_returns[group].round(4).tolist(),
+                                               label_opts=opts.LabelOpts(is_show=False),
+                                               symbol_size=0)
+                
+                if show_log_returns:
                     title = f'{factor_name} - 各分组累计对数收益率(log10)'
                     ylabel = '累计对数收益率(log10)'
-            else:
+                else:
                     title = f'{factor_name} - 各分组累计收益率'
                     ylabel = '累计收益率'
-                
-            group_chart.set_global_opts(
-                title_opts=opts.TitleOpts(title=title),
-                xaxis_opts=opts.AxisOpts(
-                    name="日期",
-                    type_="category",
-                    axislabel_opts=opts.LabelOpts(rotate=45)
-                ),
-                yaxis_opts=opts.AxisOpts(
-                    name=ylabel,
-                    is_scale=True
-                ),
-                datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
-                legend_opts=opts.LegendOpts(pos_top="5%"),
-                tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
-            )
-            group_charts.append(group_chart)
+                    
+                group_chart.set_global_opts(
+                    title_opts=opts.TitleOpts(title=title),
+                    xaxis_opts=opts.AxisOpts(
+                        name="日期",
+                        type_="category",
+                        axislabel_opts=opts.LabelOpts(rotate=45)
+                    ),
+                    yaxis_opts=opts.AxisOpts(
+                        name=ylabel,
+                        is_scale=True
+                    ),
+                    datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
+                    legend_opts=opts.LegendOpts(pos_top="5%"),
+                    tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
+                )
+                group_charts.append(group_chart)
         
         # 7. 性能对比表格
         table_data = []
@@ -931,142 +776,7 @@ class MultiFactorAnalyzer:
         
         return page
 
-    def plot_collinearity_analysis(self, beta_corr: pd.DataFrame, factor_corr_mean: pd.DataFrame,
-                                    cum_corr_cumsum: pd.DataFrame, save_path: Optional[str] = None):
-        """绘制共线性分析图表 - 使用pyecharts生成HTML"""
-        print("正在生成共线性分析图表...")
-        
-        # 1. 因子收益率相关性热力图
-        beta_heatmap = None
-        if not beta_corr.empty:
-            # 准备热力图数据
-            heatmap_data = []
-            for i, factor1 in enumerate(beta_corr.index):
-                for j, factor2 in enumerate(beta_corr.columns):
-                    value = beta_corr.loc[factor1, factor2]
-                    if not pd.isna(value):
-                        heatmap_data.append([j, i, round(float(value), 4)])
-            
-            beta_heatmap = (
-                HeatMap()
-                .add_xaxis(list(beta_corr.columns))
-                .add_yaxis("因子", list(beta_corr.index), heatmap_data,
-                          label_opts=opts.LabelOpts(is_show=False))
-                .set_global_opts(
-                    title_opts=opts.TitleOpts(title="因子收益率相关性矩阵", pos_left="center"),
-                    xaxis_opts=opts.AxisOpts(
-                        name="因子",
-                        type_="category",
-                        axislabel_opts=opts.LabelOpts(rotate=45)
-                    ),
-                    yaxis_opts=opts.AxisOpts(
-                        name="因子",
-                        type_="category"
-                    ),
-                    visualmap_opts=opts.VisualMapOpts(
-                        min_=beta_corr.values.min(),
-                        max_=beta_corr.values.max(),
-                        pos_left="right",
-                        is_calculable=True,
-                        range_color=["#313695", "#4575b4", "#74add1", "#abd9e9", "#e0f3f8", 
-                                   "#ffffcc", "#fee090", "#fdae61", "#f46d43", "#d73027"],
-                        precision=4,
-                        title="相关系数范围"
-                    )
-                )
-            )
-        
-        # 2. 截面因子值相关性均值热力图
-        factor_heatmap = None
-        if not factor_corr_mean.empty:
-            # 准备热力图数据
-            heatmap_data = []
-            for i, factor1 in enumerate(factor_corr_mean.index):
-                for j, factor2 in enumerate(factor_corr_mean.columns):
-                    value = factor_corr_mean.loc[factor1, factor2]
-                    if not pd.isna(value):
-                        heatmap_data.append([j, i, round(float(value), 4)])
-            
-            factor_heatmap = (
-                HeatMap()
-                .add_xaxis(list(factor_corr_mean.columns))
-                .add_yaxis("因子", list(factor_corr_mean.index), heatmap_data,
-                          label_opts=opts.LabelOpts(is_show=False))
-                .set_global_opts(
-                    title_opts=opts.TitleOpts(title="截面因子值相关性均值矩阵", pos_left="center"),
-                    xaxis_opts=opts.AxisOpts(
-                        name="因子",
-                        type_="category",
-                        axislabel_opts=opts.LabelOpts(rotate=45)
-                    ),
-                    yaxis_opts=opts.AxisOpts(
-                        name="因子",
-                        type_="category"
-                    ),
-                    visualmap_opts=opts.VisualMapOpts(
-                        min_=factor_corr_mean.values.min(),
-                        max_=factor_corr_mean.values.max(),
-                        pos_left="right",
-                        is_calculable=True,
-                        range_color=["#313695", "#4575b4", "#74add1", "#abd9e9", "#e0f3f8", 
-                                   "#ffffcc", "#fee090", "#fdae61", "#f46d43", "#d73027"],
-                        precision=4,
-                        title="相关系数范围"
-                    )
-                )
-            )
-        
-        # 3. 因子对累积相关性序列图
-        corr_chart = None
-        if not cum_corr_cumsum.empty:
-            corr_chart = Line()
-            for col in cum_corr_cumsum.columns:
-                corr_chart.add_xaxis([d.strftime('%Y-%m-%d') for d in cum_corr_cumsum.index])
-                corr_chart.add_yaxis(col, cum_corr_cumsum[col].round(4).tolist(),
-                                   label_opts=opts.LabelOpts(is_show=False),
-                                   symbol_size=0)
-            
-            corr_chart.set_global_opts(
-                title_opts=opts.TitleOpts(title="因子对累积相关性序列"),
-                xaxis_opts=opts.AxisOpts(
-                    name="日期",
-                    type_="category",
-                    axislabel_opts=opts.LabelOpts(rotate=45)
-                ),
-                yaxis_opts=opts.AxisOpts(
-                    name="累积相关性",
-                    is_scale=True
-                ),
-                datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
-                legend_opts=opts.LegendOpts(pos_top="5%"),
-                tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
-            )
-        
-        # 生成HTML文件
-        if save_path is None:
-            save_path = "多因子共线性分析_分析结果.html"
-        
-        # 使用Page组件组合所有图表
-        page = Page(layout=Page.SimplePageLayout)
-        
-        # 添加所有图表
-        if beta_heatmap:
-            page.add(beta_heatmap)
-        if factor_heatmap:
-            page.add(factor_heatmap)
-        if corr_chart:
-            page.add(corr_chart)
-        
-        # 保存为HTML文件
-        page.render(save_path)
-        
-        print(f"共线性分析图表已保存到: {save_path}")
-        
-        # 默认显示HTML文件
-        import webbrowser
-        webbrowser.open(save_path)
-        
-        return page
+
     
     def print_detailed_report(self, stats_df: pd.DataFrame, performance_stats: Dict):
         """打印详细分析报告"""
@@ -1092,39 +802,3 @@ class MultiFactorAnalyzer:
             print(f"\n{factor_name}:")
             print(f"  第1层多头超额: {excess_1['annual_return']:.2%} (夏普: {excess_1['sharpe_ratio']:.2f})")
             print(f"  第2层多头超额: {excess_2['annual_return']:.2%} (夏普: {excess_2['sharpe_ratio']:.2f})")
-
-    def print_collinearity_report(self, beta_corr: pd.DataFrame, factor_corr_mean: pd.DataFrame, 
-                                cum_corr_df: pd.DataFrame):
-        """打印共线性分析报告"""
-        print("\n" + "="*60)
-        print("多因子共线性分析详细报告")
-        print("="*60)
-        
-        print("\n1. 因子收益率相关性矩阵:")
-        if not beta_corr.empty:
-            print(beta_corr.round(4))
-        else:
-            print("无有效数据")
-        
-        print("\n2. 截面因子值相关性均值矩阵:")
-        if not factor_corr_mean.empty:
-            print(factor_corr_mean.round(4))
-        else:
-            print("无有效数据")
-        
-        print("\n3. 因子对相关性统计:")
-        if not cum_corr_df.empty:
-            for col in cum_corr_df.columns:
-                corr_series = cum_corr_df[col].dropna()
-                if len(corr_series) > 0:
-                    print(f"\n{col}:")
-                    print(f"  均值: {corr_series.mean():.4f}")
-                    print(f"  标准差: {corr_series.std():.4f}")
-                    print(f"  最小值: {corr_series.min():.4f}")
-                    print(f"  最大值: {corr_series.max():.4f}")
-                    print(f"  观测数: {len(corr_series)}")
-        else:
-            print("无有效数据")
-
-
-

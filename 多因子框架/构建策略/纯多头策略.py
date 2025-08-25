@@ -49,22 +49,22 @@ def _precompute_top_decile_lists(df: pd.DataFrame) -> dict:
     result = {}
     for date, group in df.groupby('date'):
         # 排除无因子值
-        group = group[group['factor'].notnull()]
+        group = group[group['market_cap'].notnull()]
         group = group[group['close'].notnull()]
         n = len(group)
         if n == 0:
             result[date] = []
             continue
-        top_n = max(1, int(np.ceil(n * 0.10)))
+        top_n = 50
         # 按因子降序取前top_n
-        top_stocks = group.sort_values('factor', ascending=False).head(top_n)['order_book_id'].tolist()
+        top_stocks = group.sort_values('market_cap', ascending=True).head(top_n)['order_book_id'].tolist()
         result[date] = top_stocks
 
     return result
 
 def init(context):
     # 周一开盘调仓（与原脚本一致）
-    scheduler.run_weekly(rebalance, tradingday=1)
+    scheduler.run_daily(rebalance)
 
     # （一次性）加载因子数据，过滤不可交易标的 —— 与原脚本逻辑一致
     print("加载因子数据并预处理（一次性）...")
@@ -76,8 +76,8 @@ def init(context):
     # 若输入已过滤也没关系，这里是幂等的
 
     # 仅保留必要列，减小对象体积
-    cols = ['date', 'order_book_id', 'factor','close','ST','suspended','limit_up_flag','limit_down_flag']
-    df = df[[c for c in cols if c in df.columns]].dropna(subset=['factor'])
+    cols = ['date', 'order_book_id', 'market_cap','close','ST','suspended','limit_up_flag','limit_down_flag']
+    df = df[[c for c in cols if c in df.columns]].dropna(subset=['market_cap'])
 
     # —— 关键加速：一次性预计算每日 Top10% 股票清单 ——
     context.top10_dict = _precompute_top_decile_lists(df)

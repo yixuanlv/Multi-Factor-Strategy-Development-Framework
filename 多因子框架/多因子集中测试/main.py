@@ -28,7 +28,7 @@ def load_data(factor_names):
     try:
         with open(data_path, 'rb') as f:
             data = pickle.load(f)
-        print(f"行情数据加载完成，数据形状: {data.shape}")
+        
     except Exception as e:
         print(f"无法加载行情数据: {e}")
         raise
@@ -41,7 +41,7 @@ def load_data(factor_names):
             with open(factor_path, 'rb') as f:
                 factor_data = pickle.load(f)
             factors_data[factor_name] = factor_data
-            print(f"因子 {factor_name} 数据加载完成，数据形状: {factor_data.shape}")
+            
         except Exception as e:
             print(f"警告：因子 {factor_name} 数据加载失败: {e}")
             continue
@@ -96,13 +96,13 @@ def prepare_data(data, factors_data):
     print(f"数据准备完成，行情数据: {data_reset.shape}，因子数据数量: {len(factors_data_ready)}")
     return data_reset, factors_data_ready
 
-def main(analysis_type='both', factor_names=None):
-    """主函数 - 支持多因子测试和共线性分析"""
+def main(factor_names=None):
+    """主函数 - 多因子集中测试分析"""
     if factor_names is None:
         factor_names = get_all_factor_names()
     
     print("=" * 60)
-    print(f"多因子综合分析 - 分析类型: {analysis_type}")
+    print(f"多因子集中测试分析")
     print(f"分析因子: {', '.join(factor_names)}")
     print("=" * 60)
     
@@ -124,30 +124,18 @@ def main(analysis_type='both', factor_names=None):
         # 创建分析器并执行分析
         analyzer = MultiFactorAnalyzer(factors_data_ready, returns_data, rebalance_period=1)
         
-        if analysis_type in ['both', 'testing']:
-            print("\n开始多因子集中测试分析...")
-            output_dir = os.path.join(work_dir, "../../测试结果/多因子集中测试结果")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            testing_results = analyzer.generate_comprehensive_report(
-                n_groups=10, method='spearman', 
-                save_path=os.path.join(output_dir, "多因子集中测试_分析结果.html")
-            )
-            save_testing_results(testing_results, output_dir)
-            print(f"多因子测试结果已保存到: {output_dir}")
+        print("\n开始多因子集中测试分析...")
+        output_dir = os.path.join(work_dir, "../../测试结果/多因子集中测试结果")
+        os.makedirs(output_dir, exist_ok=True)
         
-        if analysis_type in ['both', 'collinearity']:
-            print("\n开始多因子共线性分析...")
-            output_dir = os.path.join(work_dir, "../../测试结果/多因子共线性分析")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            collinearity_results = analyzer.generate_collinearity_report(
-                save_path=os.path.join(output_dir, "多因子共线性分析_分析结果.html")
-            )
-            save_collinearity_results(collinearity_results, output_dir)
-            print(f"共线性分析结果已保存到: {output_dir}")
+        testing_results = analyzer.generate_comprehensive_report(
+            n_groups=10, method='spearman', 
+            save_path=os.path.join(output_dir, "多因子集中测试_分析结果.html")
+        )
+        save_testing_results(testing_results, output_dir)
+        print(f"多因子测试结果已保存到: {output_dir}")
         
-        print("\n所有分析完成！")
+        print("\n分析完成！")
         
     except Exception as e:
         print(f"分析过程中出现错误: {str(e)}")
@@ -193,25 +181,9 @@ def save_testing_results(results, output_dir):
     
     pd.DataFrame(performance_summary).to_csv(f"{output_dir}/多因子性能对比汇总.csv", index=False)
 
-def save_collinearity_results(results, output_dir):
-    """保存共线性分析结果"""
-    results['beta_df'].to_csv(os.path.join(output_dir, "多因子beta序列.csv"))
-    results['beta_corr'].to_csv(os.path.join(output_dir, "多因子收益率相关性矩阵.csv"))
-    results['factor_corr_mean'].to_csv(os.path.join(output_dir, "多因子截面相关性均值矩阵.csv"))
-    results['cum_corr_cumsum'].to_csv(os.path.join(output_dir, "多因子累积相关性序列.csv"))
-    results['cum_corr_df'].to_csv(os.path.join(output_dir, "多因子相关性序列.csv"))
+
 
 if __name__ == "__main__":
-    
-    
-    # 解析命令行参数
-    analysis_type = 'testing'
-    factor_list = None
-
-    # 执行分析
-    if factor_list:
-        print(f"分析指定因子: {factor_list}")
-        main(analysis_type, factor_list)
-    else:
-        print("分析所有可用因子")
-        main(analysis_type)
+    # 执行多因子集中测试分析
+    print("开始多因子集中测试分析...")
+    main()
