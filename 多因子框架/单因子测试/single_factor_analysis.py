@@ -110,7 +110,6 @@ class SingleFactorAnalyzer:
 
     def compute_positions_and_returns(self, n_groups=10):
         """
-        重写版本：简化逻辑，确保收益率计算正确
         - 每个调仓周期内部，调仓日等权买入
         - 调仓周期内每日个股市值 = 初始权重 × (1+return).cumprod()
         - 分组收益率 = 组内股票收益率的加权平均
