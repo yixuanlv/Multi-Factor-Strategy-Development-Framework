@@ -6,6 +6,8 @@ from factor_combination import FactorCombiner
 work_dir = os.path.dirname(os.path.abspath(__file__))
 print(f"工作目录: {work_dir}")
 
+
+
 def load_data():
     """加载因子数据和价格数据（均为pkl文件）"""
     data = {}
@@ -53,11 +55,40 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
     print("因子复合分析")
     print("=" * 60)
     
-    # 如果未指定factor_names，则自动读取指定目录下所有pkl文件名作为因子名
+    # 加载数据
+    print("\n1. 加载数据...")
+    data = load_data()
+    
+    if not data:
+        print("   ✗ 数据加载失败")
+        return None
+    
+    # 分离因子数据和价格数据
+    all_factors = {k: v for k, v in data.items() if k != 'prices'}
+    prices = data['prices']
+    
+    if not all_factors:
+        print("   ✗ 没有可用的因子数据")
+        return None
+    
+    # 处理factor_names参数
     if factor_names is None:
-        factor_dir = r"C:\Users\9shao\Desktop\github公开项目\Multi-Factor-Strategy-Development-Framework\多因子框架\因子库"
-        factor_names = [os.path.splitext(f)[0] for f in os.listdir(factor_dir) if f.endswith('.pkl')]
-        print(f"自动读取因子库目录，获得因子名: {factor_names}")
+        # 如果未指定factor_names，则使用所有可用的因子
+        factor_names = list(all_factors.keys())
+        print(f"未指定因子名，使用所有可用因子: {factor_names}")
+    else:
+        # 检查指定的因子是否都存在
+        available_factors = list(all_factors.keys())
+        missing_factors = [f for f in factor_names if f not in available_factors]
+        if missing_factors:
+            print(f"警告: 以下因子不存在: {missing_factors}")
+            print(f"可用因子: {available_factors}")
+            return None
+        
+        # 只保留指定的因子
+        all_factors = {k: v for k, v in all_factors.items() if k in factor_names}
+        print(f"使用指定因子: {factor_names}")
+    
     if N_values is None:
         N_values = [30, 60, 120]
     if methods is None:
@@ -68,21 +99,8 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
     print(f"权重方法: {methods}")
     print(f"调仓周期: {rebalance_period}")
     
-    # 加载数据
-    print("\n1. 加载数据...")
-    data = load_data()
-    
-    if not data:
-        print("   ✗ 数据加载失败")
-        return None
-    
-    # 分离因子数据和价格数据
-    factors = {k: v for k, v in data.items() if k != 'prices'}
-    prices = data['prices']
-    
-    if not factors:
-        print("   ✗ 没有可用的因子数据")
-        return None
+    # 使用筛选后的因子数据
+    factors = all_factors
     
     # 运行分析
     print("\n2. 运行因子复合分析...")
@@ -162,20 +180,50 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
 
 def main(factor_names=None, N_values=None, methods=None, rebalance_period=1, save_combined_factors=True):
     """主函数 - 运行因子复合分析"""
-    return run_factor_combination_analysis(
-        factor_names=factor_names,
-        N_values=N_values,
-        methods=methods,
-        rebalance_period=rebalance_period,
-        save_combined_factors=save_combined_factors
-    )
+    try:
+        print("开始执行因子复合分析...")
+        result = run_factor_combination_analysis(
+            factor_names=factor_names,
+            N_values=N_values,
+            methods=methods,
+            rebalance_period=rebalance_period,
+            save_combined_factors=save_combined_factors
+        )
+        print("因子复合分析执行完成！")
+        return result
+    except Exception as e:
+        import traceback
+        print(f"程序执行过程中发生错误: {e}")
+        print("详细错误信息:")
+        traceback.print_exc()
+        return None
 
 if __name__ == "__main__":
     # 示例：运行因子复合分析，设置调仓周期为5天
-    main(
-        factor_names=['beta', 'size', 'momentum'], 
-        N_values=[20, 60, 120], 
-        methods=['univariate', 'multivariate', 'rank_ic'],
-        rebalance_period=5,  # 每5个交易日调仓一次
-        save_combined_factors=True  # 保存复合因子到pkl文件
-    )
+    # 方式1：指定特定因子（取消注释并修改因子名）
+    # main(
+    #     factor_names=['factor_1', 'factor_2'],  # 修改为实际存在的因子名
+    #     N_values=[20, 60, 120], 
+    #     methods=['univariate', 'multivariate', 'rank_ic'],
+    #     rebalance_period=5,  # 每5个交易日调仓一次
+    #     save_combined_factors=True  # 保存复合因子到pkl文件
+    # )
+    
+
+    try:
+        print("程序开始执行...")
+        main(
+            factor_names=['beta', 'size', 'momentum'],  # None表示使用所有可用因子
+            N_values=[20, 60, 120], 
+            methods=['univariate', 'multivariate', 'rank_ic'],
+            rebalance_period=5,  # 每5个交易日调仓一次
+            save_combined_factors=True  # 保存复合因子到pkl文件
+        )
+        print("程序执行完成！")
+    except KeyboardInterrupt:
+        print("\n程序被用户中断")
+    except Exception as e:
+        import traceback
+        print(f"程序执行失败: {e}")
+        print("详细错误信息:")
+        traceback.print_exc()

@@ -27,7 +27,20 @@ def _zscore_rowwise(df: pd.DataFrame) -> pd.DataFrame:
     def _z(s: pd.Series) -> pd.Series:
         m, v = s.mean(), s.std(ddof=0)
         return pd.Series(0.0, index=s.index) if not np.isfinite(v) or v == 0 else (s - m) / v
-    return df.apply(_z, axis=1)
+    
+    # 检查数据质量
+    print(f"    _zscore_rowwise: 输入DataFrame形状: {df.shape}")
+    print(f"    _zscore_rowwise: 包含NaN的数量: {df.isna().sum().sum()}")
+    print(f"    _zscore_rowwise: 包含无穷大的数量: {np.isinf(df.values).sum()}")
+    
+    result = df.apply(_z, axis=1)
+    
+    # 检查结果质量
+    print(f"    _zscore_rowwise: 输出DataFrame形状: {result.shape}")
+    print(f"    _zscore_rowwise: 输出包含NaN的数量: {result.isna().sum().sum()}")
+    print(f"    _zscore_rowwise: 输出包含无穷大的数量: {np.isinf(result.values).sum()}")
+    
+    return result
 
 
 def _l1_normalize(w: pd.Series, eps: float = 1e-12) -> pd.Series:
@@ -280,7 +293,7 @@ class FactorCombiner:
         pr = positions_daily.merge(ret_long, on=['date', 'order_book_id'], how='left')
         
         # 确保group列是有效的整数，过滤掉无效数据
-        pr = pr.dropna(subset=['group'])
+        pr = pr.dropna(subset=['group']).copy()  # 创建副本避免SettingWithCopyWarning
         pr['group'] = pr['group'].astype(int)
         
         # 计算权重
@@ -331,12 +344,14 @@ class FactorCombiner:
     def _compute_weight_history(self, method: str, N: int) -> pd.DataFrame:
         """计算权重历史"""
         try:
+            print(f"开始计算权重历史，方法: {method}, 滚动窗口: {N}")
             dates = self.returns_wide.index
             y = self.returns_wide
             Xz = {k: _zscore_rowwise(v) for k, v in self.factors_wide.items()}
             raw = []
 
             if method == 'univariate':
+                print(f"使用univariate方法，处理 {len(dates)} 个交易日...")
                 for dt in tqdm(dates, desc='univariate betas'):
                     try:
                         yy = y.loc[dt]
@@ -349,10 +364,13 @@ class FactorCombiner:
                             else:
                                 vals[fname] = np.nan
                         raw.append(pd.Series(vals))
-                    except Exception:
+                    except Exception as e:
+                        print(f"处理日期 {dt} 时出错: {e}")
                         raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
+                print(f"univariate方法完成，生成了 {len(raw)} 个权重记录")
 
             elif method == 'multivariate':
+                print(f"使用multivariate方法，处理 {len(dates)} 个交易日...")
                 for dt in tqdm(dates, desc='multivariate betas'):
                     try:
                         yy = y.loc[dt]
@@ -365,10 +383,13 @@ class FactorCombiner:
                                 raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
                         else:
                             raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
-                    except Exception:
+                    except Exception as e:
+                        print(f"处理日期 {dt} 时出错: {e}")
                         raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
+                print(f"multivariate方法完成，生成了 {len(raw)} 个权重记录")
 
             elif method == 'rank_ic':
+                print(f"使用rank_ic方法，处理 {len(dates)} 个交易日...")
                 for dt in tqdm(dates, desc='rank IC'):
                     try:
                         yy = y.loc[dt]
@@ -381,20 +402,33 @@ class FactorCombiner:
                             else:
                                 vals[fname] = np.nan
                         raw.append(pd.Series(vals))
-                    except Exception:
+                    except Exception as e:
+                        print(f"处理日期 {dt} 时出错: {e}")
                         raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
+                print(f"rank_ic方法完成，生成了 {len(raw)} 个权重记录")
             else:
                 raise ValueError("method 必须是 {'univariate','multivariate','rank_ic'} 之一")
 
             if not raw:
                 raise ValueError("没有生成任何权重数据")
 
+            print(f"开始创建权重DataFrame...")
             raw_df = pd.DataFrame(raw, index=dates)
+            print(f"权重DataFrame创建完成，形状: {raw_df.shape}")
+            
+            print(f"开始计算滚动平均，窗口大小: {N}")
             min_periods = min(5, N)  # 确保min_periods <= N
             weight_hist = raw_df.rolling(N, min_periods=min_periods).mean().apply(_l1_normalize, axis=1)
-            return weight_hist.fillna(0.0)
+            print(f"滚动平均计算完成，权重历史形状: {weight_hist.shape}")
+            
+            result = weight_hist.fillna(0.0)
+            print(f"权重历史计算完成，最终形状: {result.shape}")
+            return result
             
         except Exception as e:
+            print(f"计算权重历史时发生错误: {e}")
+            import traceback
+            traceback.print_exc()
             raise
 
     def _calculate_ic(self, X: pd.Series, y: pd.Series) -> float:
@@ -446,27 +480,104 @@ class FactorCombiner:
     def build(self, method: str, N: int, n_groups: int = 10) -> ComboResult:
         """构建合成因子并评估"""
         try:
+            print(f"开始构建合成因子，方法: {method}, 滚动窗口: {N}")
+            
             # 计算权重历史
+            print("步骤1: 计算权重历史...")
             weight_hist = self._compute_weight_history(method, N)
             self.current_weights = weight_hist.iloc[-1] if len(weight_hist) > 0 else pd.Series(0.0, index=self.factor_names)
+            print(f"权重历史计算完成，形状: {weight_hist.shape}")
             
             # 合成因子
-            Z = {k: _zscore_rowwise(v) for k, v in self.factors_wide.items()}
-            combined = pd.DataFrame(0.0, index=self.returns_wide.index, columns=self.returns_wide.columns)
+            print("步骤2: 合成因子...")
+            print("  2.1: 开始Z-Score标准化...")
+            try:
+                Z = {}
+                for k, v in self.factors_wide.items():
+                    print(f"    标准化因子 {k}，形状: {v.shape}")
+                    Z[k] = _zscore_rowwise(v)
+                    print(f"    因子 {k} 标准化完成")
+                print("  所有因子标准化完成")
+            except Exception as e:
+                print(f"  Z-Score标准化失败: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
             
+            print("  2.2: 创建合成因子DataFrame...")
+            combined = pd.DataFrame(0.0, index=self.returns_wide.index, columns=self.returns_wide.columns)
+            print(f"  合成因子DataFrame创建完成，形状: {combined.shape}")
+            
+            print("  2.3: 计算合成因子...")
             for fname in self.factor_names:
                 if fname in Z and fname in weight_hist.columns:
-                    w = weight_hist[fname].reindex(combined.index).fillna(0.0)
-                    combined += Z[fname].multiply(w, axis=0)
+                    print(f"    处理因子 {fname}...")
+                    print(f"      权重历史形状: {weight_hist[fname].shape}")
+                    print(f"      权重历史索引: {weight_hist[fname].index[:5]}...")
+                    print(f"      合成因子索引: {combined.index[:5]}...")
+                    
+                    try:
+                        w = weight_hist[fname].reindex(combined.index).fillna(0.0)
+                        print(f"      权重重新索引完成，形状: {w.shape}")
+                        print(f"      权重范围: [{w.min():.6f}, {w.max():.6f}]")
+                        
+                        factor_data = Z[fname]
+                        print(f"      因子数据形状: {factor_data.shape}")
+                        print(f"      因子数据索引: {factor_data.index[:5]}...")
+                        
+                        # 检查索引是否匹配
+                        if not w.index.equals(factor_data.index):
+                            print(f"      警告: 权重和因子数据索引不匹配")
+                            print(f"        权重索引长度: {len(w.index)}")
+                            print(f"        因子索引长度: {len(factor_data.index)}")
+                        
+                        print(f"      开始执行乘法运算...")
+                        print(f"        权重数据类型: {w.dtype}")
+                        print(f"        因子数据类型: {factor_data.dtypes}")
+                        print(f"        权重内存使用: {w.memory_usage(deep=True)} bytes")
+                        print(f"        因子数据内存使用: {factor_data.memory_usage(deep=True)} bytes")
+                        
+                        # 直接使用分块处理以避免内存问题
+                        print(f"      使用分块处理...")
+                        chunk_size = 500  # 减少块大小
+                        result = pd.DataFrame(0.0, index=factor_data.index, columns=factor_data.columns)
+                        
+                        for i in range(0, len(factor_data.columns), chunk_size):
+                            end_i = min(i + chunk_size, len(factor_data.columns))
+                            chunk_cols = factor_data.columns[i:end_i]
+                            chunk_data = factor_data[chunk_cols]
+                            chunk_result = chunk_data.multiply(w, axis=0)
+                            result[chunk_cols] = chunk_result
+                            print(f"        处理列 {i}-{end_i} 完成")
+                        
+                        print(f"      分块处理完成，结果形状: {result.shape}")
+                        
+                        print(f"      开始累加到合成因子...")
+                        combined += result
+                        print(f"      累加到合成因子完成")
+                        
+                    except Exception as e:
+                        print(f"      处理因子 {fname} 时出错: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        raise
+                    
+                    print(f"    因子 {fname} 处理完成")
             
             self.combined_factor = combined
+            print(f"合成因子完成，形状: {combined.shape}")
             
             # 计算收益
+            print("步骤3: 计算收益...")
+            print("  3.1: 计算持仓和收益...")
             positions_returns = self.compute_positions_and_returns(n_groups=n_groups)
+            print("  3.2: 计算IC时间序列...")
             ic_series = self._calculate_ic_series(combined)
+            print("  3.3: 计算多空收益...")
             long_short_data = self._calculate_long_short_returns(positions_returns, n_groups)
             
-            return ComboResult(
+            print("步骤4: 创建结果对象...")
+            result = ComboResult(
                 combined_factor=combined,
                 weight_history=weight_hist,
                 ic_series=ic_series,
@@ -475,7 +586,13 @@ class FactorCombiner:
                 summary=long_short_data['summary']
             )
             
+            print("合成因子构建完成！")
+            return result
+            
         except Exception as e:
+            print(f"构建合成因子时发生错误: {e}")
+            import traceback
+            traceback.print_exc()
             raise
 
     def _calculate_ic_series(self, factor: pd.DataFrame) -> pd.Series:
