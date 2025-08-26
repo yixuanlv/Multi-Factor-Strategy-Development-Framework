@@ -72,8 +72,12 @@ class FactorCombiner:
         processed_factors = {}
         
         for factor_name, factor_data in self.factors_raw.items():
-            # 检查是否为宽表格式
-            if len(factor_data.columns) > 10:
+            # 检查是否为宽表格式（索引为日期，列为股票代码）
+            if isinstance(factor_data.index, pd.DatetimeIndex) and factor_data.index.name == 'date':
+                # 已经是宽表格式
+                processed_factors[factor_name] = factor_data
+            elif len(factor_data.columns) > 10:
+                # 列数很多，可能是宽表格式
                 if not isinstance(factor_data.index, pd.DatetimeIndex):
                     try:
                         factor_data.index = pd.to_datetime(factor_data.index)
@@ -85,13 +89,20 @@ class FactorCombiner:
             elif len(factor_data.columns) == 3:
                 # 长表转宽表
                 col_names = list(factor_data.columns)
-                date_col = [col for col in col_names if 'date' in col.lower() or col == 'date'][0]
-                id_col = [col for col in col_names if 'id' in col.lower() or 'code' in col.lower() or col == 'order_book_id'][0]
-                value_col = [col for col in col_names if col not in [date_col, id_col]][0]
+                date_cols = [col for col in col_names if 'date' in col.lower() or col == 'date']
+                id_cols = [col for col in col_names if 'id' in col.lower() or 'code' in col.lower() or col == 'order_book_id']
                 
-                factor_data = factor_data.set_index(date_col).pivot(columns=id_col, values=value_col)
-                factor_data.index.name = 'date'
-                processed_factors[factor_name] = factor_data
+                if date_cols and id_cols:
+                    date_col = date_cols[0]
+                    id_col = id_cols[0]
+                    value_col = [col for col in col_names if col not in [date_col, id_col]][0]
+                    
+                    factor_data = factor_data.set_index(date_col).pivot(columns=id_col, values=value_col)
+                    factor_data.index.name = 'date'
+                    processed_factors[factor_name] = factor_data
+                else:
+                    # 如果无法识别列，保持原样
+                    processed_factors[factor_name] = factor_data
             else:
                 processed_factors[factor_name] = factor_data
         
@@ -129,13 +140,20 @@ class FactorCombiner:
                 if len(f.columns) == 3:
                     # 长表转宽表
                     col_names = list(f.columns)
-                    date_col = [col for col in col_names if 'date' in col.lower() or col == 'date'][0]
-                    id_col = [col for col in col_names if 'id' in col.lower() or 'code' in col.lower() or col == 'order_book_id'][0]
-                    value_col = [col for col in col_names if col not in [date_col, id_col]][0]
+                    date_cols = [col for col in col_names if 'date' in col.lower() or col == 'date']
+                    id_cols = [col for col in col_names if 'id' in col.lower() or 'code' in col.lower() or col == 'order_book_id']
                     
-                    f_wide = f.set_index(date_col).pivot(columns=id_col, values=value_col)
-                    f_wide.index.name = 'date'
-                    processed_factors[name] = f_wide
+                    if date_cols and id_cols:
+                        date_col = date_cols[0]
+                        id_col = id_cols[0]
+                        value_col = [col for col in col_names if col not in [date_col, id_col]][0]
+                        
+                        f_wide = f.set_index(date_col).pivot(columns=id_col, values=value_col)
+                        f_wide.index.name = 'date'
+                        processed_factors[name] = f_wide
+                    else:
+                        # 如果无法识别列，跳过这个因子
+                        continue
                 else:
                     processed_factors[name] = f
                 
@@ -144,6 +162,9 @@ class FactorCombiner:
                 
             if len(common_dates) == 0 or len(common_cols) == 0:
                 raise ValueError(f"没有共同的日期或股票: 日期数={len(common_dates)}, 股票数={len(common_cols)}")
+            
+            if len(processed_factors) == 0:
+                raise ValueError("没有可用的因子数据")
                 
             # 裁剪数据
             self.returns_wide = ret_wide.loc[common_dates, common_cols].sort_index()
@@ -210,15 +231,22 @@ class FactorCombiner:
             return pd.DataFrame(columns=['rb_date', 'order_book_id', 'group'])
         
         # 分组
-        ranks = valid_factor.rank(method='first', ascending=True)
-        group_size = max(1, len(ranks) // n_groups)
-        groups = ((ranks - 1) // group_size).clip(upper=n_groups - 1).astype(int)
-        
-        return pd.DataFrame({
-            'rb_date': date,
-            'order_book_id': valid_factor.index,
-            'group': groups.values
-        })
+        try:
+            ranks = valid_factor.rank(method='first', ascending=True)
+            group_size = max(1, len(ranks) // n_groups)
+            groups = ((ranks - 1) // group_size).clip(upper=n_groups - 1).astype(int)
+            
+            # 确保groups是有效的整数数组
+            if np.any(np.isnan(groups)) or np.any(np.isinf(groups)):
+                return pd.DataFrame(columns=['rb_date', 'order_book_id', 'group'])
+            
+            return pd.DataFrame({
+                'rb_date': date,
+                'order_book_id': valid_factor.index,
+                'group': groups.values
+            })
+        except Exception:
+            return pd.DataFrame(columns=['rb_date', 'order_book_id', 'group'])
 
     def compute_positions_and_returns(self, n_groups: int = 10) -> dict:
         """计算持仓和收益"""
@@ -247,9 +275,13 @@ class FactorCombiner:
         
         # 合并收益
         ret_long = self.returns_wide.stack().rename('ret').reset_index()
+        # 确保列名正确
+        ret_long.columns = ['date', 'order_book_id', 'ret']
         pr = positions_daily.merge(ret_long, on=['date', 'order_book_id'], how='left')
-        pr['group'] = pr['group'].astype(int)
+        
+        # 确保group列是有效的整数，过滤掉无效数据
         pr = pr.dropna(subset=['group'])
+        pr['group'] = pr['group'].astype(int)
         
         # 计算权重
         counts = pr.groupby(['rb_date','group'])['order_book_id'].nunique().rename('n').reset_index()
@@ -269,9 +301,12 @@ class FactorCombiner:
         pr['holding_weight'] = pr.groupby(['date','group'])['holding_weight'].transform(lambda x: x / x.sum() if x.sum() != 0 else 0)
         
         # 分组收益
-        group_returns = pr.groupby(['date', 'group']).apply(
-            lambda x: np.average(x['ret'], weights=x['holding_weight'])).reset_index()
-        group_returns.columns = ['date', 'group', 'group_return']
+        group_returns = []
+        for (date, group), group_data in pr.groupby(['date', 'group']):
+            if len(group_data) > 0:
+                avg_return = np.average(group_data['ret'], weights=group_data['holding_weight'])
+                group_returns.append({'date': date, 'group': group, 'group_return': avg_return})
+        group_returns = pd.DataFrame(group_returns)
         
         pr = pr.merge(group_returns, on=['date', 'group'], how='left')
         pr_nodup = pr.drop_duplicates(subset=['date', 'group'], keep='first')
@@ -355,7 +390,8 @@ class FactorCombiner:
                 raise ValueError("没有生成任何权重数据")
 
             raw_df = pd.DataFrame(raw, index=dates)
-            weight_hist = raw_df.rolling(N, min_periods=max(5, N//3)).mean().apply(_l1_normalize, axis=1)
+            min_periods = min(5, N)  # 确保min_periods <= N
+            weight_hist = raw_df.rolling(N, min_periods=min_periods).mean().apply(_l1_normalize, axis=1)
             return weight_hist.fillna(0.0)
             
         except Exception as e:
@@ -461,10 +497,11 @@ class FactorCombiner:
                 if self.enable_stock_filter and hasattr(self, 'filter_flags'):
                     valid_mask = self._filter_stocks_for_buy(date)
                     if len(valid_mask) > 0:
-                        valid_stocks = valid_mask[valid_stocks].index
-                        date_data = date_data[date_data['order_book_id'].isin(valid_stocks)]
-                        if len(date_data) >= 10:
-                            x, y = date_data['factor_value'], date_data['ret']
+                        valid_stocks = valid_mask[valid_mask].index
+                        if len(valid_stocks) > 0:
+                            date_data = date_data[date_data['order_book_id'].isin(valid_stocks)]
+                            if len(date_data) >= 10:
+                                x, y = date_data['factor_value'], date_data['ret']
                 
                 x_vals, y_vals = x.values, y.values
                 
