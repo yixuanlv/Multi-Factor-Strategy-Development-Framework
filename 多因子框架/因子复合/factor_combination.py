@@ -240,28 +240,180 @@ class FactorCombiner:
             raise
 
     def _create_rebalance_dates(self) -> None:
-        """创建调仓日期列表，确保日期是交易日"""
-        all_dates = self.returns_wide.index.tolist()
-        # 确保日期是交易日，并按日期排序
-        self.rebalance_dates = sorted(list(set(all_dates)))
-        print(f"创建调仓日期列表: {len(self.rebalance_dates)} 个调仓日")
-
-    def _filter_stocks_for_buy(self, df_on_day: pd.DataFrame) -> pd.DataFrame:
-        """买入过滤（非涨停、非ST、非停牌），向量化布尔筛选"""
-        if not self.enable_stock_filter:
-            return df_on_day
+        """创建调仓日期列表，按照调仓周期选择日期"""
+        all_dates = sorted(self.returns_wide.index.tolist())
         
-        mask = pd.Series(True, index=df_on_day.index)
+        if self.rebalance_period > 1:
+            # 按照调仓周期选择日期
+            self.rebalance_dates = all_dates[::self.rebalance_period]
+        else:
+            # 每日调仓
+            self.rebalance_dates = all_dates
+            
+        print(f"创建调仓日期列表: {len(self.rebalance_dates)} 个调仓日 (调仓周期: {self.rebalance_period})")
+
+    def _filter_stocks_for_buy(self, date: pd.Timestamp) -> pd.Series:
+        """买入过滤（非涨停、非ST、非停牌），返回当日可交易的股票列表"""
+        if not self.enable_stock_filter:
+            return pd.Series(True, index=self.returns_wide.columns)
+        
+        mask = pd.Series(True, index=self.returns_wide.columns)
         
         # 检查是否有相应的列，如果有则进行过滤
-        if 'limit_up_flag' in df_on_day.columns:
-            mask &= ~df_on_day['limit_up_flag'].astype(bool)
-        if 'ST' in df_on_day.columns:
-            mask &= ~df_on_day['ST'].astype(bool)
-        if 'suspended' in df_on_day.columns:
-            mask &= ~df_on_day['suspended'].astype(bool)
+        if 'limit_up_flag' in self.filter_flags:
+            flag_data = self.filter_flags['limit_up_flag'].loc[date]
+            mask &= ~flag_data.astype(bool)
+        if 'ST' in self.filter_flags:
+            flag_data = self.filter_flags['ST'].loc[date]
+            mask &= ~flag_data.astype(bool)
+        if 'suspended' in self.filter_flags:
+            flag_data = self.filter_flags['suspended'].loc[date]
+            mask &= ~flag_data.astype(bool)
             
-        return df_on_day[mask]
+        return mask
+
+    def _make_groups_on_rebalance_day(self, date: pd.Timestamp, n_groups: int = 10) -> pd.DataFrame:
+        """
+        单个调仓日：因子从小到大排序分组，返回列 ['rb_date','order_book_id','group']。
+        使用rank -> 等容量划分，避免qcut重复边界问题。
+        """
+        # 获取当日因子值
+        factor_values = {}
+        for factor_name, factor_data in self.factors_wide.items():
+            if date in factor_data.index:
+                factor_values[factor_name] = factor_data.loc[date]
+        
+        if not factor_values:
+            return pd.DataFrame(columns=['rb_date', 'order_book_id', 'group'])
+        
+        # 合成因子值（使用当前权重）
+        if hasattr(self, 'current_weights'):
+            combined_factor = pd.Series(0.0, index=self.returns_wide.columns)
+            for factor_name, factor_data in factor_values.items():
+                if factor_name in self.current_weights:
+                    combined_factor += factor_data * self.current_weights[factor_name]
+        else:
+            # 如果没有权重，使用第一个因子
+            combined_factor = list(factor_values.values())[0]
+        
+        # 应用股票筛选
+        valid_mask = self._filter_stocks_for_buy(date)
+        valid_stocks = valid_mask[valid_mask].index
+        
+        if len(valid_stocks) < n_groups:
+            return pd.DataFrame(columns=['rb_date', 'order_book_id', 'group'])
+        
+        # 获取有效股票的因子值
+        valid_factor = combined_factor[valid_stocks].dropna()
+        
+        if len(valid_factor) < n_groups:
+            return pd.DataFrame(columns=['rb_date', 'order_book_id', 'group'])
+        
+        # 按因子值排序分组
+        ranks = valid_factor.rank(method='first', ascending=True)
+        group_size = max(1, len(ranks) // n_groups)
+        groups = ((ranks - 1) // group_size).clip(upper=n_groups - 1).astype(int)
+        
+        out = pd.DataFrame({
+            'rb_date': date,
+            'order_book_id': valid_factor.index,
+            'group': groups.values
+        })
+        return out
+
+    def compute_positions_and_returns(self, n_groups: int = 10) -> dict:
+        """
+        计算持仓和收益：
+        - 每个调仓周期内部，调仓日等权买入
+        - 调仓周期内每日个股市值 = 初始权重 × (1+return).cumprod()
+        - 分组收益率 = 组内股票收益率的加权平均
+        """
+        print(f"  [交易层] 构建调仓分组与每日持仓 (n_groups={n_groups}, 调仓周期={self.rebalance_period}) ...")
+        
+        # 调仓日分组
+        group_labels_list = []
+        for date in self.rebalance_dates:
+            if date in self.returns_wide.index:
+                res = self._make_groups_on_rebalance_day(date, n_groups)
+                if len(res) > 0:
+                    group_labels_list.append(res)
+        
+        if not group_labels_list:
+            raise ValueError("没有生成任何分组数据")
+        
+        group_labels_rebalance = pd.concat(group_labels_list, ignore_index=True)
+        
+        # 每个交易日映射到最近调仓日
+        all_dates = sorted(self.returns_wide.index)
+        dates_df = pd.DataFrame({'date': all_dates})
+        rb_df = pd.DataFrame({'rb_date': pd.to_datetime(self.rebalance_dates)})
+        map_df = pd.merge_asof(dates_df, rb_df, left_on='date', right_on='rb_date', direction='backward')
+        positions_daily = map_df.merge(group_labels_rebalance, how='left', on='rb_date')
+        positions_daily = positions_daily[['date', 'rb_date', 'order_book_id', 'group']]
+        
+        # 合并未来收益
+        ret_long = self.returns_wide.stack().rename('ret').reset_index()
+        pr = positions_daily.merge(ret_long, on=['date', 'order_book_id'], how='left')
+        pr['group'] = pr['group'].astype(int)
+        
+        # 确保数据对齐：只保留有分组信息的记录
+        pr = pr.dropna(subset=['group'])
+        
+        # 计算初始权重（基于调仓日）
+        counts = pr.groupby(['rb_date','group'])['order_book_id'].nunique().rename('n').reset_index()
+        pr = pr.merge(counts, on=['rb_date','group'], how='left')
+        pr['start_weight'] = 1.0 / pr['n']
+        
+        # 计算累计收益
+        pr['gross'] = pr['ret'] + 1.0
+        
+        # 处理nan值：将nan替换为1（停牌日收益为0）
+        pr['gross'] = pr['gross'].fillna(1.0)
+        
+        # 计算累计收益
+        pr['stock_cum'] = pr.groupby(['rb_date','group','order_book_id'])['gross'].cumprod()
+        
+        # 计算持仓权重：初始权重 × 累计收益
+        pr['holding_weight'] = np.where(
+            pr['rb_date'] == pr['date'],
+            pr['start_weight'],
+            pr['start_weight'] * pr['stock_cum']
+        )
+        
+        # 对每个日期每个分组内的持仓权重进行归一化，使其和为1
+        pr['holding_weight'] = pr.groupby(['date','group'])['holding_weight'].transform(lambda x: x / x.sum() if x.sum() != 0 else 0)
+        
+        # 向量化计算分组每日收益率
+        group_returns = pr.groupby(['date', 'group']).apply(
+            lambda x: np.average(x['ret'], weights=x['holding_weight'])).reset_index()
+        group_returns.columns = ['date', 'group', 'group_return']
+        
+        # 将组收益率合并回原始数据框
+        pr = pr.merge(group_returns, on=['date', 'group'], how='left')
+        
+        # 先去重，只保留每个（date, group）组合的第一条记录，避免pivot时报错
+        pr_nodup = pr.drop_duplicates(subset=['date', 'group'], keep='first')
+        group_daily_returns = pr_nodup.pivot(index='date', columns='group', values='group_return').fillna(0.0)
+        
+        # 按列排序确保分组顺序一致
+        group_daily_returns = group_daily_returns.reindex(sorted(group_daily_returns.columns), axis=1)
+        
+        # 计算分组累计净值
+        group_cum_nav = (group_daily_returns+1).cumprod()
+        
+        # 确保所有日期都有数据，缺失值用前值填充
+        group_daily_returns = group_daily_returns.reindex(all_dates, method='ffill').fillna(0.0)
+        group_cum_nav = group_cum_nav.reindex(all_dates, method='ffill')
+        
+        return {
+            'group_daily_returns': group_daily_returns,
+            'group_cum_nav': group_cum_nav,
+            'positions_daily': positions_daily,
+            'rebalance_info': {
+                'rebalance_dates': self.rebalance_dates,
+                'group_labels_rebalance': group_labels_rebalance
+            }
+        }
 
     # ---- 日度横截面系数 / IC ----
     def _cs_univariate_beta(self, X: pd.Series, y: pd.Series) -> float:
@@ -639,6 +791,13 @@ class FactorCombiner:
             title_opts=opts.TitleOpts(title="累计IC对比"),
             datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
             xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=45)),
+            tooltip_opts=opts.TooltipOpts(
+                trigger="axis",
+                axis_pointer_type="cross",
+                formatter=opts.TooltipOpts(
+                    formatter="{b}<br/>{a}: {c:.4f}"
+                )
+            )
         )
         page.add(line_ic)
 
@@ -655,10 +814,17 @@ class FactorCombiner:
             s_log = np.log10(s)
             line_ls.add_yaxis(m, s_log.values.tolist(), is_smooth=True, symbol_size=0, label_opts=opts.LabelOpts(is_show=False))
         line_ls.set_global_opts(
-            title_opts=opts.TitleOpts(title="纯多累计收益对比 (log10)"),
+            title_opts=opts.TitleOpts(title="最高分组累计收益对比 (因子值最大的10%, log10)"),
             datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
             xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=45)),
             yaxis_opts=opts.AxisOpts(name="累计收益 (log10)"),
+            tooltip_opts=opts.TooltipOpts(
+                trigger="axis",
+                axis_pointer_type="cross",
+                formatter=opts.TooltipOpts(
+                    formatter="{b}<br/>{a}: {c:.4f}"
+                )
+            )
         )
         page.add(line_ls)
 
@@ -681,14 +847,39 @@ class FactorCombiner:
             if len(grp_final) > 0:
                 x = [f"G{int(i)+1}" for i in grp_final.index.tolist()]
                 y = [float(v) if pd.notna(v) else 1.0 for v in grp_final.values]
+                
+                # 计算收益率百分比
+                y_percent = [(v - 1.0) * 100 if v > 0 else 0.0 for v in y]
+                
+                # 创建悬停提示数据
+                tooltip_data = []
+                for i, (val, pct) in enumerate(zip(y, y_percent)):
+                    tooltip_data.append(f"分组{i+1}<br/>累计净值: {val:.4f}<br/>收益率: {pct:.2f}%")
+                
                 bar = (
                     Bar()
                     .add_xaxis(x)
-                    .add_yaxis("累计收益", y, label_opts=opts.LabelOpts(is_show=False))
+                    .add_yaxis(
+                        "累计收益", 
+                        y, 
+                        label_opts=opts.LabelOpts(is_show=False),
+                        tooltip_opts=opts.TooltipOpts(
+                            formatter=opts.TooltipOpts(
+                                formatter="{b}<br/>{a}: {c:.4f}<br/>收益率: {c_percent:.2f}%"
+                            )
+                        )
+                    )
                     .set_global_opts(
                         title_opts=opts.TitleOpts(title=f"最佳方法: {best_name} 分组累计收益"),
                         xaxis_opts=opts.AxisOpts(name="分组"),
                         yaxis_opts=opts.AxisOpts(name="累计收益"),
+                        tooltip_opts=opts.TooltipOpts(
+                            trigger="axis",
+                            axis_pointer_type="shadow",
+                            formatter=opts.TooltipOpts(
+                                formatter=lambda params: tooltip_data[params[0].dataIndex] if params and len(params) > 0 else ""
+                            )
+                        )
                     )
                 )
                 page.add(bar)
