@@ -47,7 +47,7 @@ def load_data():
 
     return data
 
-def run_factor_combination_analysis(factor_names=None, N_values=None, methods=None):
+def run_factor_combination_analysis(factor_names=None, N_values=None, methods=None, rebalance_period=1, save_combined_factors=True):
     """运行因子复合分析"""
     print("=" * 60)
     print("因子复合分析")
@@ -66,6 +66,7 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
     print(f"分析因子: {factor_names}")
     print(f"滚动窗口: {N_values}")
     print(f"权重方法: {methods}")
+    print(f"调仓周期: {rebalance_period}")
     
     # 加载数据
     print("\n1. 加载数据...")
@@ -86,6 +87,7 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
     # 运行分析
     print("\n2. 运行因子复合分析...")
     results = {}
+    combined_factors_data = {}  # 存储复合因子数据
     
     for method in methods:
         print(f"\n   分析方法: {method}")
@@ -97,12 +99,24 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
                 combiner = FactorCombiner(
                     factors=factors,
                     prices=prices,
-                    rebalance_period=1
+                    rebalance_period=rebalance_period
                 )
                 
                 # 运行分析
                 result = combiner.build(method=method, N=N)
                 results[f"{method}_N{N}"] = result
+                
+                # 保存复合因子数据
+                if save_combined_factors:
+                    combined_factors_data[f"{method}_N{N}"] = {
+                        'combined_factor': result.combined_factor,
+                        'weight_history': result.weight_history,
+                        'method': method,
+                        'N': N,
+                        'rebalance_period': rebalance_period,
+                        'factor_names': list(factors.keys()),
+                        'summary': result.summary
+                    }
                 
                 print(f"        ✓ 完成 - IC均值: {result.summary['ic_mean']:.4f}, 夏普: {result.summary['sharpe_ratio']:.2f}")
                 
@@ -110,9 +124,29 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
                 print(f"        ✗ 失败: {e}")
                 continue
     
+    # 保存复合因子到pkl文件
+    if save_combined_factors and combined_factors_data:
+        print("\n3. 保存复合因子到pkl文件...")
+        try:
+            # 创建复合因子保存目录
+            combined_factor_dir = os.path.join(work_dir, "../因子库/复合因子库")
+            os.makedirs(combined_factor_dir, exist_ok=True)
+            
+            # 保存每个方法的复合因子
+            for key, data in combined_factors_data.items():
+                pkl_filename = f"combined_factor_{key}.pkl"
+                pkl_path = os.path.join(combined_factor_dir, pkl_filename)
+                
+                # 保存到pkl文件
+                pd.to_pickle(data, pkl_path)
+            print(f"   ✓ 所有复合因子已保存到目录: {combined_factor_dir}")
+            
+        except Exception as e:
+            print(f"   ✗ 复合因子保存失败: {e}")
+    
     # 生成报告
     if results:
-        print("\n3. 生成分析报告...")
+        print("\n4. 生成分析报告...")
         try:
             html_path = os.path.join(work_dir, "因子复合分析报告.html")
             combiner.render_report(results, html_path)
@@ -124,16 +158,24 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
     print("因子复合分析完成")
     print("=" * 60)
     
-    return results
+    return results, combined_factors_data
 
-def main(factor_names=None, N_values=None, methods=None):
+def main(factor_names=None, N_values=None, methods=None, rebalance_period=1, save_combined_factors=True):
     """主函数 - 运行因子复合分析"""
     return run_factor_combination_analysis(
         factor_names=factor_names,
         N_values=N_values,
-        methods=methods
+        methods=methods,
+        rebalance_period=rebalance_period,
+        save_combined_factors=save_combined_factors
     )
 
 if __name__ == "__main__":
-
-    main(factor_names=['beta', 'size', 'momentum'], N_values=[20,60,120], methods=['univariate', 'multivariate', 'rank_ic'])
+    # 示例：运行因子复合分析，设置调仓周期为5天
+    main(
+        factor_names=['beta', 'size', 'momentum'], 
+        N_values=[20, 60, 120], 
+        methods=['univariate', 'multivariate', 'rank_ic'],
+        rebalance_period=5,  # 每5个交易日调仓一次
+        save_combined_factors=True  # 保存复合因子到pkl文件
+    )
