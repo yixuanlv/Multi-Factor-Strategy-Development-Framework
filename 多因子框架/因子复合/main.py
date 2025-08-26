@@ -136,4 +136,4 @@ def main(factor_names=None, N_values=None, methods=None):
 
 if __name__ == "__main__":
 
-    main(factor_names=['beta', 'size', 'momentum'], N_values=[60], methods=['univariate'])
+    main(factor_names=['beta', 'size', 'momentum'], N_values=[20,60,120], methods=['univariate', 'multivariate', 'rank_ic'])

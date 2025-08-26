@@ -67,7 +67,7 @@ class ComboResult:
     combined_factor: pd.DataFrame           # (date x stock) 合成因子
     weight_history: pd.DataFrame            # (date x factor) 权重历史
     ic_series: pd.Series                    # 合成因子的日度IC（Spearman）
-    ls_returns: pd.Series                   # 多空组合日度收益
+    long_only_returns: pd.Series            # 纯多组合日度收益
     group_returns: pd.DataFrame             # 各分组日度未来收益
     summary: dict                           # 统计指标
 
@@ -80,6 +80,7 @@ class FactorCombiner:
         factors: Dict[str, pd.DataFrame],
         prices: pd.DataFrame,
         rebalance_period: int = 1,
+        enable_stock_filter: bool = True,
         future_return_col: str = "return",
     ) -> None:
         """
@@ -90,12 +91,16 @@ class FactorCombiner:
             或宽表格式（索引为日期，列为股票代码，值为因子值）
         prices : DataFrame
             至少三列: ['date', 'order_book_id', 'close']
+            可选列: ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended']
         rebalance_period : int
-            未来收益偏移期（>=1）
+            调仓周期（>=1），表示每隔多少个交易日调仓一次
+        enable_stock_filter : bool
+            是否启用股票筛选（剔除ST、涨停、停牌等）
         """
         self.factors_raw = {k: v.copy() for k, v in factors.items()}
         self.prices = prices.copy()
-        self.rebalance = int(rebalance_period)
+        self.rebalance_period = int(rebalance_period)
+        self.enable_stock_filter = bool(enable_stock_filter)
 
         # 检测并处理数据格式
         self._detect_and_convert_data_format()
@@ -105,6 +110,7 @@ class FactorCombiner:
 
         self.factor_names = list(self.factors_raw.keys())
         self._align()
+        self._create_rebalance_dates()
 
     def _detect_and_convert_data_format(self):
         """处理因子数据格式，统一为宽表格式"""
@@ -152,17 +158,30 @@ class FactorCombiner:
         try:
             print("开始数据对齐...")
             print(f"原始价格数据形状: {self.prices.shape}")
-            print(f"原始因子数据: {list(self.factors_raw.keys())}")
+           # print(f"原始因子数据: {list(self.factors_raw.keys())}")
             
             # 1. 计算未来收益
             px = self.prices.sort_values(['order_book_id', 'date'])
-            px['return'] = px.groupby('order_book_id')['close'].pct_change(fill_method=None).shift(-self.rebalance)
-            ret = px[['date', 'order_book_id', 'return']].dropna()
+            px['return'] = px.groupby('order_book_id')['close'].pct_change(fill_method=None).shift(-1)
+            
+            # 保留筛选列
+            filter_cols = ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended']
+            available_filter_cols = [col for col in filter_cols if col in px.columns]
+            
+            ret = px[['date', 'order_book_id', 'return'] + available_filter_cols].dropna(subset=['return'])
             print(f"未来收益数据形状: {ret.shape}")
             
             # 2. 转换为宽表格式
             ret_wide = ret.pivot(index='date', columns='order_book_id', values='return')
+            
+            # 创建筛选列的宽表
+            self.filter_flags = {}
+            for col in available_filter_cols:
+                flag_wide = ret.pivot(index='date', columns='order_book_id', values=col)
+                self.filter_flags[col] = flag_wide
+            
             print(f"收益宽表形状: {ret_wide.shape}")
+            print(f"筛选标志列: {list(self.filter_flags.keys())}")
             
             # 3. 数据对齐（求所有矩阵的共同交集）
             common_dates = ret_wide.index
@@ -171,7 +190,7 @@ class FactorCombiner:
             # 处理因子数据，确保都是宽表格式
             processed_factors = {}
             for name, f in self.factors_raw.items():
-                print(f"处理因子 {name}: 原始形状 {f.shape}")
+                #print(f"处理因子 {name}: 原始形状 {f.shape}")
                 
                 # 如果因子数据是长表格式，转换为宽表
                 if len(f.columns) == 3:
@@ -180,22 +199,22 @@ class FactorCombiner:
                     id_col = [col for col in col_names if 'id' in col.lower() or 'code' in col.lower() or col == 'order_book_id'][0]
                     value_col = [col for col in col_names if col not in [date_col, id_col]][0]
                     
-                    print(f"  长表格式: date_col={date_col}, id_col={id_col}, value_col={value_col}")
+                    #print(f"  长表格式: date_col={date_col}, id_col={id_col}, value_col={value_col}")
                     
                     # 转换为宽表
                     f_wide = f.set_index(date_col).pivot(columns=id_col, values=value_col)
                     f_wide.index.name = 'date'
                     processed_factors[name] = f_wide
-                    print(f"  转换为宽表后形状: {f_wide.shape}")
+                    #print(f"  转换为宽表后形状: {f_wide.shape}")
                 else:
                     # 已经是宽表格式
                     processed_factors[name] = f
-                    print(f"  已经是宽表格式: {f.shape}")
+                    #print(f"  已经是宽表格式: {f.shape}")
                 
                 # 更新共同交集
                 common_dates = common_dates.intersection(processed_factors[name].index)
                 common_cols = common_cols.intersection(processed_factors[name].columns)
-                print(f"  当前共同交集: 日期={len(common_dates)}, 股票={len(common_cols)}")
+                #print(f"  当前共同交集: 日期={len(common_dates)}, 股票={len(common_cols)}")
                 
             if len(common_dates) == 0 or len(common_cols) == 0:
                 raise ValueError(f"没有共同的日期或股票: 日期数={len(common_dates)}, 股票数={len(common_cols)}")
@@ -205,15 +224,44 @@ class FactorCombiner:
             self.factors_wide = {k: v.loc[common_dates, common_cols].sort_index() for k, v in processed_factors.items()}
             self.factor_names = list(self.factors_wide.keys())
             
+            # 裁剪筛选标志列
+            for col in self.filter_flags:
+                self.filter_flags[col] = self.filter_flags[col].loc[common_dates, common_cols].sort_index()
+            
             # 5. 输出最终数据信息
             print(f"数据对齐完成: {len(common_dates)} 个交易日, {len(common_cols)} 只股票, {len(self.factor_names)} 个因子")
-            print(f"最终收益数据形状: {self.returns_wide.shape}")
-            for name, f in self.factors_wide.items():
-                print(f"  因子 {name} 最终形状: {f.shape}")
+            #print(f"最终收益数据形状: {self.returns_wide.shape}")
+            #for name, f in self.factors_wide.items():
+                
+                #print(f"  因子 {name} 最终形状: {f.shape}")
             
         except Exception as e:
             print(f"数据对齐失败: {str(e)}")
             raise
+
+    def _create_rebalance_dates(self) -> None:
+        """创建调仓日期列表，确保日期是交易日"""
+        all_dates = self.returns_wide.index.tolist()
+        # 确保日期是交易日，并按日期排序
+        self.rebalance_dates = sorted(list(set(all_dates)))
+        print(f"创建调仓日期列表: {len(self.rebalance_dates)} 个调仓日")
+
+    def _filter_stocks_for_buy(self, df_on_day: pd.DataFrame) -> pd.DataFrame:
+        """买入过滤（非涨停、非ST、非停牌），向量化布尔筛选"""
+        if not self.enable_stock_filter:
+            return df_on_day
+        
+        mask = pd.Series(True, index=df_on_day.index)
+        
+        # 检查是否有相应的列，如果有则进行过滤
+        if 'limit_up_flag' in df_on_day.columns:
+            mask &= ~df_on_day['limit_up_flag'].astype(bool)
+        if 'ST' in df_on_day.columns:
+            mask &= ~df_on_day['ST'].astype(bool)
+        if 'suspended' in df_on_day.columns:
+            mask &= ~df_on_day['suspended'].astype(bool)
+            
+        return df_on_day[mask]
 
     # ---- 日度横截面系数 / IC ----
     def _cs_univariate_beta(self, X: pd.Series, y: pd.Series) -> float:
@@ -437,7 +485,7 @@ class FactorCombiner:
                 combined_factor=combined,
                 weight_history=weight_hist,
                 ic_series=result['ic_series'],
-                ls_returns=result['long_short_returns'],
+                long_only_returns=result['long_only_returns'],
                 group_returns=result['group_returns'],
                 summary={k: result[k] for k in ['ic_mean','ic_std','icir','ic_positive_ratio','annual_return','annual_volatility','sharpe_ratio']}
             )
@@ -511,18 +559,18 @@ class FactorCombiner:
         df = df.dropna(subset=['group'])
         group_ret = df.groupby(['date','group'])['ret'].mean().unstack()
 
-        # 多空 = 最高组 - 最低组
-        if group_ret.shape[1] >= 2:
-            ls = group_ret.iloc[:, -1].fillna(0) - group_ret.iloc[:, 0].fillna(0)
+        # 纯多 = 最高分组（因子值最大的那一组）
+        if group_ret.shape[1] >= 1:
+            long_only = group_ret.iloc[:, -1].fillna(0)  # 最高分组（因子值最大的那一组）
         else:
-            ls = pd.Series(dtype=float)
+            long_only = pd.Series(dtype=float)
 
         # 年化指标（按252）
-        if len(ls) > 0:
-            total = float((1.0 + ls.fillna(0)).prod() - 1.0)
-            years = len(ls) / 252.0
+        if len(long_only) > 0:
+            total = float((1.0 + long_only.fillna(0)).prod() - 1.0)
+            years = len(long_only) / 252.0
             ann = (1.0 + total) ** (1.0 / years) - 1.0 if years > 0 else np.nan
-            vol = float(ls.std() * np.sqrt(252.0))
+            vol = float(long_only.std() * np.sqrt(252.0))
             sharpe = ann / vol if (vol and vol != 0) else np.nan
         else:
             ann = vol = sharpe = np.nan
@@ -534,7 +582,7 @@ class FactorCombiner:
             icir=icir,
             ic_positive_ratio=ic_pos,
             group_returns=group_ret,
-            long_short_returns=ls,
+            long_only_returns=long_only,  # 改为纯多收益
             annual_return=ann,
             annual_volatility=vol,
             sharpe_ratio=sharpe,
@@ -566,7 +614,11 @@ class FactorCombiner:
             .add_yaxis("权重", y_labels, data, label_opts=opts.LabelOpts(is_show=False))
             .set_global_opts(
                 title_opts=opts.TitleOpts(title="滚动权重热力图"),
-                visualmap_opts=opts.VisualMapOpts(min_=float(np.nanmin(W.values)), max_=float(np.nanmax(W.values))),
+                visualmap_opts=opts.VisualMapOpts(
+                    min_=float(np.nanmin(W.values)), 
+                    max_=float(np.nanmax(W.values)),
+                    range_color=["#FF0000", "#FFFFFF", "#0000FF"]  # 红白蓝从大到小
+                ),
                 xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=45)),
                 datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
             )
@@ -590,24 +642,27 @@ class FactorCombiner:
         )
         page.add(line_ic)
 
-        # 3) 多空累计收益
+        # 3) 纯多累计收益（log10对数形式）
         line_ls = Line()
         idx_ref = None
         for m, res in result_map.items():
-            s = (1 + res.ls_returns.fillna(0)).cumprod()
+            s = (1 + res.long_only_returns.fillna(0)).cumprod()
             if idx_ref is None:
                 idx_ref = s.index
                 line_ls.add_xaxis([d.strftime('%Y-%m-%d') for d in idx_ref])
             s = s.reindex(idx_ref).ffill().fillna(1)
-            line_ls.add_yaxis(m, s.values.tolist(), is_smooth=True, symbol_size=0, label_opts=opts.LabelOpts(is_show=False))
+            # 转换为log10对数形式
+            s_log = np.log10(s)
+            line_ls.add_yaxis(m, s_log.values.tolist(), is_smooth=True, symbol_size=0, label_opts=opts.LabelOpts(is_show=False))
         line_ls.set_global_opts(
-            title_opts=opts.TitleOpts(title="多空累计收益对比"),
+            title_opts=opts.TitleOpts(title="纯多累计收益对比 (log10)"),
             datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
             xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=45)),
+            yaxis_opts=opts.AxisOpts(name="累计收益 (log10)"),
         )
         page.add(line_ls)
 
-        # 4) 选择夏普最高的方法，画分组平均收益柱状
+        # 4) 选择夏普最高的方法，画分组累计收益柱状
         best_name = None
         best_sharpe = -np.inf
         for m, res in result_map.items():
@@ -616,20 +671,27 @@ class FactorCombiner:
                 best_sharpe = sh
                 best_name = m
         if best_name is not None:
-            grp_mean = result_map[best_name].group_returns.mean()
-            x = [f"G{int(i)+1}" for i in grp_mean.index.tolist()]
-            y = [float(v) if pd.notna(v) else 0.0 for v in grp_mean.values]
-            bar = (
-                Bar()
-                .add_xaxis(x)
-                .add_yaxis("平均未来收益", y)
-                .set_global_opts(
-                    title_opts=opts.TitleOpts(title=f"最佳方法: {best_name} 分组收益"),
-                    xaxis_opts=opts.AxisOpts(name="分组"),
-                    yaxis_opts=opts.AxisOpts(name="收益"),
+            # 计算各分组的累计收益
+            grp_returns = result_map[best_name].group_returns
+            grp_cumulative = (1 + grp_returns.fillna(0)).cumprod()
+            
+            # 取最后一期的累计值
+            grp_final = grp_cumulative.iloc[-1] if len(grp_cumulative) > 0 else pd.Series()
+            
+            if len(grp_final) > 0:
+                x = [f"G{int(i)+1}" for i in grp_final.index.tolist()]
+                y = [float(v) if pd.notna(v) else 1.0 for v in grp_final.values]
+                bar = (
+                    Bar()
+                    .add_xaxis(x)
+                    .add_yaxis("累计收益", y, label_opts=opts.LabelOpts(is_show=False))
+                    .set_global_opts(
+                        title_opts=opts.TitleOpts(title=f"最佳方法: {best_name} 分组累计收益"),
+                        xaxis_opts=opts.AxisOpts(name="分组"),
+                        yaxis_opts=opts.AxisOpts(name="累计收益"),
+                    )
                 )
-            )
-            page.add(bar)
+                page.add(bar)
 
         # 5) 性能表格
         rows = []
