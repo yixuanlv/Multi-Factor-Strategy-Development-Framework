@@ -118,6 +118,13 @@ class SingleFactorAnalyzer:
 
         print(f"  [交易层] 构建调仓分组与每日持仓 (n_groups={n_groups}, 周期={self.rebalance_period}) ...")
 
+        # 初始化过滤统计
+        filter_stats = {
+            'limit_up_count': 0,
+            'st_count': 0,
+            'suspended_count': 0,
+            'total_filtered': 0
+        }
 
         md = self.merged_data.copy().sort_values(['order_book_id', 'date'])
         md['future_return'] = md.groupby('order_book_id')['return'].shift(-1)
@@ -126,6 +133,26 @@ class SingleFactorAnalyzer:
         df_rb = md[md['date'].isin(self.rebalance_dates)].copy()
         group_labels_list = []
         for d, g in df_rb.groupby('date'):
+            # 统计过滤次数
+            if self.enable_stock_filter:
+                # 统计具体过滤原因
+                if 'limit_up_flag' in g.columns:
+                    limit_up_count = g['limit_up_flag'].astype(bool).sum()
+                    filter_stats['limit_up_count'] += limit_up_count
+                if 'ST' in g.columns:
+                    st_count = g['ST'].astype(bool).sum()
+                    filter_stats['st_count'] += st_count
+                if 'suspended' in g.columns:
+                    suspended_count = g['suspended'].astype(bool).sum()
+                    filter_stats['suspended_count'] += suspended_count
+                
+                # 计算当日总共过滤的股票数量
+                original_count = len(g)
+                filtered_g = self._filter_stocks_for_buy(g)
+                filtered_count = len(filtered_g)
+                daily_filtered = original_count - filtered_count
+                filter_stats['total_filtered'] += daily_filtered
+            
             res = self._make_groups_on_rebalance_day(g, n_groups)
             if len(res) > 0:
                 group_labels_list.append(res)
@@ -203,6 +230,14 @@ class SingleFactorAnalyzer:
         # 确保所有日期都有数据，缺失值用前值填充
         group_daily_returns = group_daily_returns.reindex(all_dates, method='ffill').fillna(0.0)
         group_cum_nav = group_cum_nav.reindex(all_dates, method='ffill')
+
+        # 显示过滤统计信息
+        if self.enable_stock_filter and filter_stats['total_filtered'] > 0:
+            print(f"  [交易层] 过滤次数统计: 涨停: {filter_stats['limit_up_count']} 次, ST: {filter_stats['st_count']} 次, 停牌: {filter_stats['suspended_count']} 次, 总计: {filter_stats['total_filtered']} 次")
+        elif self.enable_stock_filter:
+            print(f"  [交易层] 未过滤任何股票")
+        else:
+            print(f"  [交易层] 股票过滤已禁用")
 
         return {
             'group_daily_returns': group_daily_returns,

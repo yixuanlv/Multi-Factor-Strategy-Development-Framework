@@ -72,10 +72,12 @@ class FactorCombiner:
         factors: Dict[str, pd.DataFrame],
         prices: pd.DataFrame,
         rebalance_period: int = 1,
+        enable_stock_filter: bool = True,
     ) -> None:
         self.factors_raw = {k: v.copy() for k, v in factors.items()}
         self.prices = prices.copy()
         self.rebalance_period = int(rebalance_period)
+        self.enable_stock_filter = enable_stock_filter
         
         # 缓存标准化后的因子数据
         self._factors_zscore_cache = {}
@@ -139,6 +141,8 @@ class FactorCombiner:
             px['date'] = pd.to_datetime(px['date'])
             px['return'] = px.groupby('order_book_id')['close'].pct_change(fill_method=None).shift(-1)
             px['future_return'] = px.groupby('order_book_id')['return'].shift(-1)
+            
+            # 构建收益数据
             ret = px[['date', 'order_book_id', 'future_return']].dropna(subset=['future_return'])
             ret_wide = ret.pivot(index='date', columns='order_book_id', values='future_return')
             
@@ -188,8 +192,38 @@ class FactorCombiner:
         self.rebalance_dates = all_dates[::self.rebalance_period] if self.rebalance_period > 1 else all_dates
 
     def _filter_stocks_for_buy(self, date: pd.Timestamp) -> pd.Series:
-        """股票筛选"""
-        return pd.Series(True, index=self.returns_wide.columns)
+        """股票筛选：过滤ST、停牌、涨停股票"""
+        # 获取当日所有股票
+        all_stocks = self.returns_wide.columns
+        
+        # 如果没有价格数据，返回所有股票
+        if not hasattr(self, 'prices') or self.prices is None:
+            return pd.Series(True, index=all_stocks)
+        
+        # 获取当日的数据
+        date_data = self.prices[self.prices['date'] == date]
+        if len(date_data) == 0:
+            return pd.Series(True, index=all_stocks)
+        
+        # 创建过滤掩码
+        mask = pd.Series(True, index=all_stocks)
+        
+        # 过滤涨停股票
+        if 'limit_up_flag' in date_data.columns:
+            limit_up_stocks = date_data[date_data['limit_up_flag'].astype(bool)]['order_book_id'].tolist()
+            mask.loc[mask.index.isin(limit_up_stocks)] = False
+        
+        # 过滤ST股票
+        if 'ST' in date_data.columns:
+            st_stocks = date_data[date_data['ST'].astype(bool)]['order_book_id'].tolist()
+            mask.loc[mask.index.isin(st_stocks)] = False
+        
+        # 过滤停牌股票
+        if 'suspended' in date_data.columns:
+            suspended_stocks = date_data[date_data['suspended'].astype(bool)]['order_book_id'].tolist()
+            mask.loc[mask.index.isin(suspended_stocks)] = False
+        
+        return mask
 
     def _make_groups_on_rebalance_day(self, date: pd.Timestamp, n_groups: int = 10) -> pd.DataFrame:
         """单个调仓日分组"""
@@ -241,14 +275,47 @@ class FactorCombiner:
             return pd.DataFrame(columns=['rb_date', 'order_book_id', 'group'])
 
     def compute_positions_and_returns(self, n_groups: int = 10) -> dict:
-        """计算持仓和收益（简单优化版本）"""
+        """计算持仓和收益"""
         start_time = time.time()
         print(f"  [交易层] 构建调仓分组与每日持仓 (n_groups={n_groups}, 调仓周期={self.rebalance_period}) ...")
+        
+        # 统计过滤信息
+        filter_stats = {
+            'limit_up_count': 0,
+            'st_count': 0,
+            'suspended_count': 0,
+            'total_filtered': 0
+        }
         
         # 1. 预计算所有调仓日的分组
         group_labels_list = []
         for date in self.rebalance_dates:
             if date in self.returns_wide.index:
+                # 统计当日过滤的股票数量
+                if self.enable_stock_filter:
+                    valid_mask = self._filter_stocks_for_buy(date)
+                    total_stocks = len(valid_mask)
+                    valid_stocks = valid_mask.sum()
+                    filtered_stocks = total_stocks - valid_stocks
+                    
+                    if filtered_stocks > 0:
+                        # 获取具体的过滤原因
+                        date_data = self.prices[self.prices['date'] == date]
+                        if len(date_data) > 0:
+                            if 'limit_up_flag' in date_data.columns:
+                                limit_up_count = date_data['limit_up_flag'].astype(bool).sum()
+                                filter_stats['limit_up_count'] += limit_up_count
+                            
+                            if 'ST' in date_data.columns:
+                                st_count = date_data['ST'].astype(bool).sum()
+                                filter_stats['st_count'] += st_count
+                            
+                            if 'suspended' in date_data.columns:
+                                suspended_count = date_data['suspended'].astype(bool).sum()
+                                filter_stats['suspended_count'] += suspended_count
+                        
+                        filter_stats['total_filtered'] += filtered_stocks
+                
                 res = self._make_groups_on_rebalance_day(date, n_groups)
                 if len(res) > 0:
                     group_labels_list.append(res)
@@ -309,6 +376,13 @@ class FactorCombiner:
         group_cum_nav = group_cum_nav.reindex(all_dates, method='ffill')
         
         print(f"  收益计算完成，耗时: {time.time() - start_time:.2f}秒")
+        # 显示过滤统计信息（合并为一行）
+        if self.enable_stock_filter and filter_stats['total_filtered'] > 0:
+            print(f"[交易层] 过滤统计: 涨停: {filter_stats['limit_up_count']} 次, ST: {filter_stats['st_count']} 次, 停牌: {filter_stats['suspended_count']} 次, 总计: {filter_stats['total_filtered']} 次")
+        elif self.enable_stock_filter:
+            print(f"[交易层] 未过滤任何股票")
+        else:
+            print(f"[交易层] 股票过滤已禁用")
         
         return {
             'group_daily_returns': group_daily_returns,
@@ -631,99 +705,7 @@ class FactorCombiner:
         years = len(returns) / 252.0
         return (1 + total_return) ** (1.0 / years) - 1 if years > 0 else np.nan
 
-    def _calculate_ic_series(self, factor: pd.DataFrame) -> pd.Series:
-        """计算IC时间序列（优化版本）"""
-        # 使用向量化操作，避免循环
-        factor_values = factor.values
-        returns_values = self.returns_wide.values
-        
-        # 预分配IC数组
-        ic_series = pd.Series(index=factor.index, dtype=float)
-        
-        for i, date in enumerate(factor.index):
-            # 获取当前日期的数据
-            f_vals = factor_values[i, :]
-            r_vals = returns_values[i, :]
-            
-            # 过滤NaN值
-            mask = ~(np.isnan(f_vals) | np.isnan(r_vals))
-            if np.sum(mask) < 10:
-                ic_series.iloc[i] = np.nan
-                continue
-            
-            f_clean = f_vals[mask]
-            r_clean = r_vals[mask]
-            
-            # 股票筛选
-            if self.enable_stock_filter and hasattr(self, 'filter_flags'):
-                valid_mask = self._filter_stocks_for_buy(date)
-                if len(valid_mask) > 0:
-                    valid_stocks = valid_mask[valid_mask].index
-                    if len(valid_stocks) > 0:
-                        # 获取有效股票的索引
-                        stock_indices = [j for j, stock in enumerate(factor.columns) if stock in valid_stocks]
-                        if len(stock_indices) >= 10:
-                            f_clean = f_vals[stock_indices]
-                            r_clean = r_vals[stock_indices]
-                            # 再次过滤NaN
-                            mask2 = ~(np.isnan(f_clean) | np.isnan(r_clean))
-                            if np.sum(mask2) >= 10:
-                                f_clean = f_clean[mask2]
-                                r_clean = r_clean[mask2]
-            
-            # 计算IC
-            if len(f_clean) >= 10:
-                if np.std(f_clean, ddof=0) == 0 or np.std(r_clean, ddof=0) == 0:
-                    ic_series.iloc[i] = np.nan
-                else:
-                    try:
-                        ic_series.iloc[i] = float(stats.spearmanr(f_clean, r_clean)[0])
-                    except Exception:
-                        ic_series.iloc[i] = np.nan
-            else:
-                ic_series.iloc[i] = np.nan
 
-        return ic_series
-
-    def _calculate_long_short_returns(self, positions_returns: dict, n_groups: int) -> dict:
-        """计算多空收益和统计指标"""
-        grp_ret = positions_returns['group_daily_returns']
-        
-        # 选择最高分组
-        if grp_ret.shape[1] >= 1:
-            long_only = grp_ret.iloc[:, -1].fillna(0)
-        else:
-            long_only = pd.Series(dtype=float)
-
-        # 年化指标
-        if len(long_only) > 0:
-            total = float((1.0 + long_only.fillna(0)).prod() - 1.0)
-            years = len(long_only) / 252.0
-            ann = (1.0 + total) ** (1.0 / years) - 1.0 if years > 0 else np.nan
-            vol = float(long_only.std() * np.sqrt(252.0))
-            sharpe = ann / vol if (vol and vol != 0) else np.nan
-        else:
-            ann = vol = sharpe = np.nan
-
-        # IC统计
-        ic_series = self._calculate_ic_series(self.combined_factor) if hasattr(self, 'combined_factor') else pd.Series(dtype=float)
-        ic_mean = float(ic_series.mean()) if len(ic_series) else np.nan
-        ic_std = float(ic_series.std()) if len(ic_series) else np.nan
-        icir = ic_mean / ic_std if (ic_std and ic_std != 0) else np.nan
-        ic_pos = float((ic_series > 0).mean()) if len(ic_series) else np.nan
-
-        return {
-            'long_only_returns': long_only,
-            'summary': {
-                'ic_mean': ic_mean,
-                'ic_std': ic_std,
-                'icir': icir,
-                'ic_positive_ratio': ic_pos,
-                'annual_return': ann,
-                'annual_volatility': vol,
-                'sharpe_ratio': sharpe,
-            }
-        }
 
     def render_report(self, result_map: Dict[str, ComboResult], html_path: str) -> None:
         """生成HTML报告"""

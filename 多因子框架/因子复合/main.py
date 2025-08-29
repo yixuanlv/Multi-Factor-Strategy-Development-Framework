@@ -95,7 +95,7 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
     if methods is None:
         methods = ['univariate', 'multivariate', 'rank_ic']
     
-    print(f"分析因子: {factor_names}")
+    print(f"分析因子: {len(factor_names)}")
     print(f"滚动窗口: {N_values}")
     print(f"权重方法: {methods}")
     print(f"调仓周期: {rebalance_period}")
@@ -118,7 +118,8 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
                 combiner = FactorCombiner(
                     factors=factors,
                     prices=prices,
-                    rebalance_period=rebalance_period
+                    rebalance_period=rebalance_period,
+                    enable_stock_filter=True
                 )
                 
                 # 运行分析 - 添加新的参数支持
@@ -218,7 +219,7 @@ if __name__ == "__main__":
             factor_names=None,  # None表示使用所有可用因子
             N_values=[20, 60, 120], 
             methods=['multivariate', 'rank_ic'],
-            rebalance_period=1,  # 每5个交易日调仓一次
+            rebalance_period=5,  # 每5个交易日调仓一次
             save_combined_factors=True,  # 保存复合因子到pkl文件
             n_groups=10,         # 分组数
             lag_days=1,          # 滞后天数
