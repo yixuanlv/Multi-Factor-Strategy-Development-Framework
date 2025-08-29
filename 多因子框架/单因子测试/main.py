@@ -174,7 +174,7 @@ def run_single_factor_analysis(factor_name,rebalance_period):
 def main(factor_name,rebalance_period):
     """主函数，支持批量分析所有因子"""
     if factor_name is None:
-        factor_dir = os.path.join(work_dir, "../因子库")
+        factor_dir = os.path.join(work_dir, "../因子库/复合因子库")
         all_files = os.listdir(factor_dir)
         factor_files = [f for f in all_files if f.endswith('.pkl')]
         if not factor_files:
@@ -187,4 +187,4 @@ def main(factor_name,rebalance_period):
 
 if __name__ == "__main__":
     #main(factor_name='residual_5day_all_factor',rebalance_period = 5)
-    main(factor_name= 'pb_ttm',rebalance_period = 1)
+    main(factor_name= 'combined_factor_multivariate_N120',rebalance_period = 1)

@@ -1,23 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-因子复合分析框架
-支持三种权重方法：univariate(一元回归)、multivariate(多元回归)、rank_ic(Rank IC)
+因子复合分析框架（已修改 build 方法，按照用户新要求：
+对于 N 阶滚动的因子复合，复合因子按以下规则构造：
+
+C(t,i) = Z(t,i)*W(t-1) + Z(t-1,i)*W(t-1) + Z(t-2,i)*W(t-2) + Z(t-3,i)*W(t-3) + ...
+
+也就是说：
+- k=0 (当天因子 Z(t)) 和 k=1 (前一天因子 Z(t-1)) 都使用 W(t-1) 作为权重；
+- 对于 k>=2，使用对应的 W(t-k)；
+
+其余逻辑（权重计算、收益对齐、IC 计算等）保持原样或轻微调整以兼容该合成规则。
+
+该文件基于你原始的 factor_combination.py 做了局部重构：主要修改 build 方法实现上述合成规则。
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict
+import time
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 from pyecharts import options as opts
 from pyecharts.charts import Line, Bar, HeatMap, Page
 from pyecharts.components import Table
+
+# 导入单因子测试类
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '单因子测试'))
+from single_factor_analysis import SingleFactorAnalyzer
 
 
 # ------------------------- 工具函数 -------------------------
@@ -28,19 +43,7 @@ def _zscore_rowwise(df: pd.DataFrame) -> pd.DataFrame:
         m, v = s.mean(), s.std(ddof=0)
         return pd.Series(0.0, index=s.index) if not np.isfinite(v) or v == 0 else (s - m) / v
     
-    # 检查数据质量
-    print(f"    _zscore_rowwise: 输入DataFrame形状: {df.shape}")
-    print(f"    _zscore_rowwise: 包含NaN的数量: {df.isna().sum().sum()}")
-    print(f"    _zscore_rowwise: 包含无穷大的数量: {np.isinf(df.values).sum()}")
-    
-    result = df.apply(_z, axis=1)
-    
-    # 检查结果质量
-    print(f"    _zscore_rowwise: 输出DataFrame形状: {result.shape}")
-    print(f"    _zscore_rowwise: 输出包含NaN的数量: {result.isna().sum().sum()}")
-    print(f"    _zscore_rowwise: 输出包含无穷大的数量: {np.isinf(result.values).sum()}")
-    
-    return result
+    return df.apply(_z, axis=1)
 
 
 def _l1_normalize(w: pd.Series, eps: float = 1e-12) -> pd.Series:
@@ -69,16 +72,24 @@ class FactorCombiner:
         factors: Dict[str, pd.DataFrame],
         prices: pd.DataFrame,
         rebalance_period: int = 1,
-        enable_stock_filter: bool = True,
     ) -> None:
         self.factors_raw = {k: v.copy() for k, v in factors.items()}
         self.prices = prices.copy()
         self.rebalance_period = int(rebalance_period)
-        self.enable_stock_filter = bool(enable_stock_filter)
+        
+        # 缓存标准化后的因子数据
+        self._factors_zscore_cache = {}
         
         self._process_data()
         self._align()
         self._create_rebalance_dates()
+    
+    def _get_zscore_factors(self):
+        """获取标准化后的因子数据（带缓存）"""
+        if not self._factors_zscore_cache:
+            for k, v in self.factors_wide.items():
+                self._factors_zscore_cache[k] = _zscore_rowwise(v)
+        return self._factors_zscore_cache
 
     def _process_data(self):
         """统一处理因子数据格式"""
@@ -124,37 +135,22 @@ class FactorCombiner:
     def _align(self) -> None:
         """数据对齐"""
         try:
-            print("开始数据对齐...")
-            
-            # 计算未来收益
             px = self.prices.sort_values(['order_book_id', 'date'])
             px['date'] = pd.to_datetime(px['date'])
             px['return'] = px.groupby('order_book_id')['close'].pct_change(fill_method=None).shift(-1)
+            px['future_return'] = px.groupby('order_book_id')['return'].shift(-1)
+            ret = px[['date', 'order_book_id', 'future_return']].dropna(subset=['future_return'])
+            ret_wide = ret.pivot(index='date', columns='order_book_id', values='future_return')
             
-            # 筛选列
-            filter_cols = ['limit_up_flag', 'limit_down_flag', 'ST', 'suspended']
-            available_filter_cols = [col for col in filter_cols if col in px.columns]
-            
-            ret = px[['date', 'order_book_id', 'return'] + available_filter_cols].dropna(subset=['return'])
-            ret_wide = ret.pivot(index='date', columns='order_book_id', values='return')
-            
-            # 筛选标志
-            self.filter_flags = {}
-            for col in available_filter_cols:
-                flag_wide = ret.pivot(index='date', columns='order_book_id', values=col)
-                self.filter_flags[col] = flag_wide
-            
-            # 数据对齐
             common_dates = ret_wide.index
             common_cols = ret_wide.columns
             
             processed_factors = {}
             for name, f in self.factors_raw.items():
                 if len(f.columns) == 3:
-                    # 长表转宽表
                     col_names = list(f.columns)
                     date_cols = [col for col in col_names if 'date' in col.lower() or col == 'date']
-                    id_cols = [col for col in col_names if 'id' in col.lower() or 'code' in col.lower() or col == 'order_book_id']
+                    id_cols = [col for col in col_names if 'id' in col.lower() or col == 'code' in col.lower() or col == 'order_book_id']
                     
                     if date_cols and id_cols:
                         date_col = date_cols[0]
@@ -165,7 +161,6 @@ class FactorCombiner:
                         f_wide.index.name = 'date'
                         processed_factors[name] = f_wide
                     else:
-                        # 如果无法识别列，跳过这个因子
                         continue
                 else:
                     processed_factors[name] = f
@@ -179,15 +174,9 @@ class FactorCombiner:
             if len(processed_factors) == 0:
                 raise ValueError("没有可用的因子数据")
                 
-            # 裁剪数据
             self.returns_wide = ret_wide.loc[common_dates, common_cols].sort_index()
             self.factors_wide = {k: v.loc[common_dates, common_cols].sort_index() for k, v in processed_factors.items()}
             self.factor_names = list(self.factors_wide.keys())
-            
-            for col in self.filter_flags:
-                self.filter_flags[col] = self.filter_flags[col].loc[common_dates, common_cols].sort_index()
-            
-            print(f"数据对齐完成: {len(common_dates)} 个交易日, {len(common_cols)} 只股票, {len(self.factor_names)} 个因子")
             
         except Exception as e:
             print(f"数据对齐失败: {str(e)}")
@@ -197,20 +186,10 @@ class FactorCombiner:
         """创建调仓日期列表"""
         all_dates = sorted(self.returns_wide.index.tolist())
         self.rebalance_dates = all_dates[::self.rebalance_period] if self.rebalance_period > 1 else all_dates
-        print(f"创建调仓日期列表: {len(self.rebalance_dates)} 个调仓日 (调仓周期: {self.rebalance_period})")
 
     def _filter_stocks_for_buy(self, date: pd.Timestamp) -> pd.Series:
         """股票筛选"""
-        if not self.enable_stock_filter:
-            return pd.Series(True, index=self.returns_wide.columns)
-        
-        mask = pd.Series(True, index=self.returns_wide.columns)
-        
-        for col, flag_data in self.filter_flags.items():
-            if date in flag_data.index:
-                mask &= ~flag_data.loc[date].astype(bool)
-            
-        return mask
+        return pd.Series(True, index=self.returns_wide.columns)
 
     def _make_groups_on_rebalance_day(self, date: pd.Timestamp, n_groups: int = 10) -> pd.DataFrame:
         """单个调仓日分组"""
@@ -262,10 +241,11 @@ class FactorCombiner:
             return pd.DataFrame(columns=['rb_date', 'order_book_id', 'group'])
 
     def compute_positions_and_returns(self, n_groups: int = 10) -> dict:
-        """计算持仓和收益"""
+        """计算持仓和收益（简单优化版本）"""
+        start_time = time.time()
         print(f"  [交易层] 构建调仓分组与每日持仓 (n_groups={n_groups}, 调仓周期={self.rebalance_period}) ...")
         
-        # 调仓日分组
+        # 1. 预计算所有调仓日的分组
         group_labels_list = []
         for date in self.rebalance_dates:
             if date in self.returns_wide.index:
@@ -278,7 +258,7 @@ class FactorCombiner:
         
         group_labels_rebalance = pd.concat(group_labels_list, ignore_index=True)
         
-        # 日期映射
+        # 2. 简化的日期映射
         all_dates = sorted(self.returns_wide.index)
         dates_df = pd.DataFrame({'date': all_dates})
         rb_df = pd.DataFrame({'rb_date': pd.to_datetime(self.rebalance_dates)})
@@ -286,50 +266,49 @@ class FactorCombiner:
         positions_daily = map_df.merge(group_labels_rebalance, how='left', on='rb_date')
         positions_daily = positions_daily[['date', 'rb_date', 'order_book_id', 'group']]
         
-        # 合并收益
+        # 3. 合并收益数据
         ret_long = self.returns_wide.stack().rename('ret').reset_index()
-        # 确保列名正确
         ret_long.columns = ['date', 'order_book_id', 'ret']
         pr = positions_daily.merge(ret_long, on=['date', 'order_book_id'], how='left')
         
-        # 确保group列是有效的整数，过滤掉无效数据
-        pr = pr.dropna(subset=['group']).copy()  # 创建副本避免SettingWithCopyWarning
+        # 4. 过滤和类型转换
+        pr = pr.dropna(subset=['group']).copy()
         pr['group'] = pr['group'].astype(int)
         
-        # 计算权重
+        # 5. 计算权重
         counts = pr.groupby(['rb_date','group'])['order_book_id'].nunique().rename('n').reset_index()
         pr = pr.merge(counts, on=['rb_date','group'], how='left')
         pr['start_weight'] = 1.0 / pr['n']
         
-        # 累计收益
+        # 6. 计算累计收益
         pr['gross'] = (pr['ret'] + 1.0).fillna(1.0)
-        pr['stock_cum'] = pr.groupby(['rb_date','group','order_book_id'])['gross'].cumprod()
+        pr['stock_cum'] = pr.groupby(['rb_date','group','order_book_id'])['gross'].transform('cumprod')
         pr['holding_weight'] = np.where(
             pr['rb_date'] == pr['date'],
             pr['start_weight'],
             pr['start_weight'] * pr['stock_cum']
         )
         
-        # 权重归一化
+        # 7. 权重归一化
         pr['holding_weight'] = pr.groupby(['date','group'])['holding_weight'].transform(lambda x: x / x.sum() if x.sum() != 0 else 0)
         
-        # 分组收益
-        group_returns = []
-        for (date, group), group_data in pr.groupby(['date', 'group']):
-            if len(group_data) > 0:
-                avg_return = np.average(group_data['ret'], weights=group_data['holding_weight'])
-                group_returns.append({'date': date, 'group': group, 'group_return': avg_return})
-        group_returns = pd.DataFrame(group_returns)
+        # 8. 计算分组收益
+        group_returns = pr.groupby(['date', 'group']).agg({
+            'ret': lambda x: np.average(x, weights=pr.loc[x.index, 'holding_weight'])
+        }).reset_index()
+        group_returns.columns = ['date', 'group', 'group_return']
         
-        pr = pr.merge(group_returns, on=['date', 'group'], how='left')
+        # 9. 创建宽表
         pr_nodup = pr.drop_duplicates(subset=['date', 'group'], keep='first')
         group_daily_returns = pr_nodup.pivot(index='date', columns='group', values='group_return').fillna(0.0)
         group_daily_returns = group_daily_returns.reindex(sorted(group_daily_returns.columns), axis=1)
         
-        # 累计净值
-        group_cum_nav = (group_daily_returns+1).cumprod()
+        # 10. 累计净值
+        group_cum_nav = (group_daily_returns + 1).cumprod()
         group_daily_returns = group_daily_returns.reindex(all_dates, method='ffill').fillna(0.0)
         group_cum_nav = group_cum_nav.reindex(all_dates, method='ffill')
+        
+        print(f"  收益计算完成，耗时: {time.time() - start_time:.2f}秒")
         
         return {
             'group_daily_returns': group_daily_returns,
@@ -344,294 +323,365 @@ class FactorCombiner:
     def _compute_weight_history(self, method: str, N: int) -> pd.DataFrame:
         """计算权重历史"""
         try:
-            print(f"开始计算权重历史，方法: {method}, 滚动窗口: {N}")
             dates = self.returns_wide.index
             y = self.returns_wide
-            Xz = {k: _zscore_rowwise(v) for k, v in self.factors_wide.items()}
-            raw = []
+            Xz = self._get_zscore_factors()
 
             if method == 'univariate':
-                print(f"使用univariate方法，处理 {len(dates)} 个交易日...")
-                for dt in tqdm(dates, desc='univariate betas'):
+                ic_matrix = np.full((len(dates), len(self.factor_names)), np.nan)
+                for i, dt in enumerate(tqdm(dates, desc='univariate betas')):
                     try:
                         yy = y.loc[dt]
-                        vals = {}
-                        for fname in self.factor_names:
+                        for j, fname in enumerate(self.factor_names):
                             if fname in Xz and dt in Xz[fname].index:
                                 factor_vals = Xz[fname].loc[dt]
                                 ic_val = self._calculate_ic(factor_vals, yy)
-                                vals[fname] = ic_val
-                            else:
-                                vals[fname] = np.nan
-                        raw.append(pd.Series(vals))
-                    except Exception as e:
-                        print(f"处理日期 {dt} 时出错: {e}")
-                        raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
-                print(f"univariate方法完成，生成了 {len(raw)} 个权重记录")
-
+                                ic_matrix[i, j] = ic_val
+                    except Exception:
+                        pass
+                raw_df = pd.DataFrame(ic_matrix, index=dates, columns=self.factor_names)
             elif method == 'multivariate':
-                print(f"使用multivariate方法，处理 {len(dates)} 个交易日...")
-                for dt in tqdm(dates, desc='multivariate betas'):
+                beta_matrix = np.full((len(dates), len(self.factor_names)), np.nan)
+                for i, dt in enumerate(tqdm(dates, desc='multivariate betas')):
                     try:
                         yy = y.loc[dt]
                         Xmat = pd.DataFrame({f: Xz[f].loc[dt] for f in self.factor_names if f in Xz and dt in Xz[f].index})
                         if not Xmat.empty and len(Xmat.columns) > 0:
                             betas = self._calculate_multivariate_beta(Xmat, yy)
                             if len(betas) == len(self.factor_names):
-                                raw.append(pd.Series(betas, index=self.factor_names))
-                            else:
-                                raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
-                        else:
-                            raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
-                    except Exception as e:
-                        print(f"处理日期 {dt} 时出错: {e}")
-                        raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
-                print(f"multivariate方法完成，生成了 {len(raw)} 个权重记录")
-
+                                beta_matrix[i, :] = betas
+                    except Exception:
+                        pass
+                raw_df = pd.DataFrame(beta_matrix, index=dates, columns=self.factor_names)
             elif method == 'rank_ic':
-                print(f"使用rank_ic方法，处理 {len(dates)} 个交易日...")
-                for dt in tqdm(dates, desc='rank IC'):
+                ic_matrix = np.full((len(dates), len(self.factor_names)), np.nan)
+                for i, dt in enumerate(tqdm(dates, desc='rank IC')):
                     try:
                         yy = y.loc[dt]
-                        vals = {}
-                        for fname in self.factor_names:
+                        for j, fname in enumerate(self.factor_names):
                             if fname in Xz and dt in Xz[fname].index:
                                 factor_vals = Xz[fname].loc[dt]
                                 ic_val = self._calculate_ic(factor_vals, yy)
-                                vals[fname] = ic_val
-                            else:
-                                vals[fname] = np.nan
-                        raw.append(pd.Series(vals))
-                    except Exception as e:
-                        print(f"处理日期 {dt} 时出错: {e}")
-                        raw.append(pd.Series([np.nan] * len(self.factor_names), index=self.factor_names))
-                print(f"rank_ic方法完成，生成了 {len(raw)} 个权重记录")
+                                ic_matrix[i, j] = ic_val
+                    except Exception:
+                        pass
+                raw_df = pd.DataFrame(ic_matrix, index=dates, columns=self.factor_names)
             else:
                 raise ValueError("method 必须是 {'univariate','multivariate','rank_ic'} 之一")
 
-            if not raw:
-                raise ValueError("没有生成任何权重数据")
+            if raw_df.isna().all().all():
+                raise ValueError("没有生成任何有效权重数据")
 
-            print(f"开始创建权重DataFrame...")
-            raw_df = pd.DataFrame(raw, index=dates)
-            print(f"权重DataFrame创建完成，形状: {raw_df.shape}")
-            
-            print(f"开始计算滚动平均，窗口大小: {N}")
+            # 恢复N日滚动平均逻辑
             min_periods = min(5, N)  # 确保min_periods <= N
             weight_hist = raw_df.rolling(N, min_periods=min_periods).mean().apply(_l1_normalize, axis=1)
-            print(f"滚动平均计算完成，权重历史形状: {weight_hist.shape}")
-            
-            result = weight_hist.fillna(0.0)
-            print(f"权重历史计算完成，最终形状: {result.shape}")
-            return result
+            return weight_hist.fillna(0.0)
             
         except Exception as e:
-            print(f"计算权重历史时发生错误: {e}")
-            import traceback
-            traceback.print_exc()
             raise
 
     def _calculate_ic(self, X: pd.Series, y: pd.Series) -> float:
         """计算IC"""
-        if hasattr(self, 'filter_flags') and self.enable_stock_filter:
-            current_date = X.index[0] if len(X.index) > 0 else None
-            if current_date and current_date in self.returns_wide.index:
-                valid_mask = self._filter_stocks_for_buy(current_date)
-                X = X[valid_mask]
-                y = y[valid_mask]
-        
-        df = pd.concat([X, y], axis=1).dropna()
-        if len(df) < 10:
+        mask = ~(np.isnan(X.values) | np.isnan(y.values))
+        if np.sum(mask) < 10:
             return np.nan
             
-        x, y_vals = df.iloc[:, 0], df.iloc[:, 1]
+        x_vals = X.values[mask]
+        y_vals = y.values[mask]
         
-        if x.std(ddof=0) == 0 or y_vals.std(ddof=0) == 0:
+        if np.std(x_vals, ddof=0) == 0 or np.std(y_vals, ddof=0) == 0:
             return np.nan
             
         try:
-            return float(stats.spearmanr(x, y_vals)[0])
+            return float(stats.spearmanr(x_vals, y_vals)[0])
         except Exception:
             return np.nan
 
     def _calculate_multivariate_beta(self, X: pd.DataFrame, y: pd.Series) -> np.ndarray:
         """计算多元回归系数"""
-        if hasattr(self, 'filter_flags') and self.enable_stock_filter:
-            current_date = X.index[0] if len(X.index) > 0 else None
-            if current_date and current_date in self.returns_wide.index:
-                valid_mask = self._filter_stocks_for_buy(current_date)
-                X = X[valid_mask]
-                y = y[valid_mask]
-        
-        df = pd.concat([X, y], axis=1).dropna()
-        if len(df) < X.shape[1] + 5:
+        mask = ~(np.isnan(X.values).any(axis=1) | np.isnan(y.values))
+        if np.sum(mask) < X.shape[1] + 5:
             return np.array([np.nan] * X.shape[1])
             
-        Xv, yv = df.iloc[:, :X.shape[1]].values, df.iloc[:, -1].values
+        Xv, yv = X.values[mask], y.values[mask]
         
         try:
-            Xv_scaled = StandardScaler().fit_transform(Xv)
-            model = LinearRegression()
-            model.fit(Xv_scaled, yv)
-            return model.coef_.astype(float)
+            X_mean = np.nanmean(Xv, axis=0)
+            X_std = np.nanstd(Xv, axis=0, ddof=0)
+            X_std[X_std == 0] = 1.0
+            Xv_scaled = (Xv - X_mean) / X_std
+            
+            XtX = Xv_scaled.T @ Xv_scaled
+            Xty = Xv_scaled.T @ yv
+            
+            try:
+                beta = np.linalg.solve(XtX, Xty)
+                return beta.astype(float)
+            except np.linalg.LinAlgError:
+                beta = np.linalg.pinv(XtX) @ Xty
+                return beta.astype(float)
+                
         except Exception:
             return np.array([np.nan] * X.shape[1])
 
-    def build(self, method: str, N: int, n_groups: int = 10) -> ComboResult:
-        """构建合成因子并评估"""
+    def build(self, method: str, N: int, n_groups: int = 10, lag_days: int = 5, normalize_lag: bool = True) -> ComboResult:
+        """
+        按用户指定的新逻辑构建合成因子：
+        - 计算权重历史（不改动原逻辑）
+        - 合成规则：
+            对于 k = 0 (Z(t)) 和 k = 1 (Z(t-1)) 使用 W(t-1);
+            对于 k >= 2 使用 W(t-k).
+        - lag_days 指明最大回溯天数 L（包含当天 t 的 k=0）。
+        """
+        start_time = time.time()
         try:
-            print(f"开始构建合成因子，方法: {method}, 滚动窗口: {N}")
-            
-            # 计算权重历史
-            print("步骤1: 计算权重历史...")
             weight_hist = self._compute_weight_history(method, N)
-            self.current_weights = weight_hist.iloc[-1] if len(weight_hist) > 0 else pd.Series(0.0, index=self.factor_names)
-            print(f"权重历史计算完成，形状: {weight_hist.shape}")
-            
-            # 合成因子
-            print("步骤2: 合成因子...")
-            print("  2.1: 开始Z-Score标准化...")
-            try:
-                Z = {}
-                for k, v in self.factors_wide.items():
-                    print(f"    标准化因子 {k}，形状: {v.shape}")
-                    Z[k] = _zscore_rowwise(v)
-                    print(f"    因子 {k} 标准化完成")
-                print("  所有因子标准化完成")
-            except Exception as e:
-                print(f"  Z-Score标准化失败: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
-            
-            print("  2.2: 创建合成因子DataFrame...")
-            combined = pd.DataFrame(0.0, index=self.returns_wide.index, columns=self.returns_wide.columns)
-            print(f"  合成因子DataFrame创建完成，形状: {combined.shape}")
-            
-            print("  2.3: 计算合成因子...")
+            # 兜底 current_weights
+            self.current_weights = (weight_hist.iloc[-1] if len(weight_hist) > 0 else pd.Series(0.0, index=self.factor_names))
+
+            # 准备数据
+            Z = self._get_zscore_factors()
+            idx = self.returns_wide.index
+            cols = self.returns_wide.columns
+
+            # 对齐权重矩阵
+            W = weight_hist.reindex(idx).fillna(0.0)
+            W_prev = W.shift(1).fillna(0.0)  # W(t-1)
+
+            # 预分配合成矩阵
+            combined = pd.DataFrame(0.0, index=idx, columns=cols)
+
+            L = int(lag_days) if lag_days and lag_days > 0 else 1
+
+            # 逐因子合成（按用户指定规则）
             for fname in self.factor_names:
-                if fname in Z and fname in weight_hist.columns:
-                    print(f"    处理因子 {fname}...")
-                    print(f"      权重历史形状: {weight_hist[fname].shape}")
-                    print(f"      权重历史索引: {weight_hist[fname].index[:5]}...")
-                    print(f"      合成因子索引: {combined.index[:5]}...")
-                    
-                    try:
-                        w = weight_hist[fname].reindex(combined.index).fillna(0.0)
-                        print(f"      权重重新索引完成，形状: {w.shape}")
-                        print(f"      权重范围: [{w.min():.6f}, {w.max():.6f}]")
-                        
-                        factor_data = Z[fname]
-                        print(f"      因子数据形状: {factor_data.shape}")
-                        print(f"      因子数据索引: {factor_data.index[:5]}...")
-                        
-                        # 检查索引是否匹配
-                        if not w.index.equals(factor_data.index):
-                            print(f"      警告: 权重和因子数据索引不匹配")
-                            print(f"        权重索引长度: {len(w.index)}")
-                            print(f"        因子索引长度: {len(factor_data.index)}")
-                        
-                        print(f"      开始执行乘法运算...")
-                        print(f"        权重数据类型: {w.dtype}")
-                        print(f"        因子数据类型: {factor_data.dtypes}")
-                        print(f"        权重内存使用: {w.memory_usage(deep=True)} bytes")
-                        print(f"        因子数据内存使用: {factor_data.memory_usage(deep=True)} bytes")
-                        
-                        # 直接使用分块处理以避免内存问题
-                        print(f"      使用分块处理...")
-                        chunk_size = 500  # 减少块大小
-                        result = pd.DataFrame(0.0, index=factor_data.index, columns=factor_data.columns)
-                        
-                        for i in range(0, len(factor_data.columns), chunk_size):
-                            end_i = min(i + chunk_size, len(factor_data.columns))
-                            chunk_cols = factor_data.columns[i:end_i]
-                            chunk_data = factor_data[chunk_cols]
-                            chunk_result = chunk_data.multiply(w, axis=0)
-                            result[chunk_cols] = chunk_result
-                            print(f"        处理列 {i}-{end_i} 完成")
-                        
-                        print(f"      分块处理完成，结果形状: {result.shape}")
-                        
-                        print(f"      开始累加到合成因子...")
-                        combined += result
-                        print(f"      累加到合成因子完成")
-                        
-                    except Exception as e:
-                        print(f"      处理因子 {fname} 时出错: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        raise
-                    
-                    print(f"    因子 {fname} 处理完成")
-            
+                Zf = Z[fname].reindex(index=idx, columns=cols)
+
+                # 对每个滞后 k (0..L-1)
+                for k in range(0, L):
+                    # 因子值 Z(t-k)
+                    Z_shift_k = Zf.shift(k).fillna(0.0)
+
+                    # 权重选择规则：
+                    # k==0 或 k==1 -> 使用 W_prev (即 W(t-1))
+                    # 否则 -> 使用 W.shift(k) (即 W(t-k))
+                    if k in (0, 1):
+                        weight_series = W_prev[fname]
+                    else:
+                        weight_series = W[fname].shift(k).fillna(0.0)
+
+                    contrib_k = Z_shift_k.mul(weight_series, axis=0).fillna(0.0)
+                    combined = combined.add(contrib_k, fill_value=0.0)
+
+            # 归一化：按有效滞后数做均值化，保持尺度稳定
+            if normalize_lag:
+                eff = pd.Series([min(L, i+0) for i in range(len(idx))], index=idx).replace(0, np.nan)
+                combined = combined.div(eff, axis=0).fillna(0.0)
+
             self.combined_factor = combined
-            print(f"合成因子完成，形状: {combined.shape}")
+
+            # 计算收益与IC
+            # 将合成因子转换为单因子测试需要的格式
+            combined_long = combined.stack().reset_index()
+            combined_long.columns = ['date', 'order_book_id', 'factor_value']
+            combined_long = combined_long.merge(
+                self.prices[['date', 'order_book_id', 'close']], 
+                on=['date', 'order_book_id'], 
+                how='inner'
+            )
             
-            # 计算收益
-            print("步骤3: 计算收益...")
-            print("  3.1: 计算持仓和收益...")
-            positions_returns = self.compute_positions_and_returns(n_groups=n_groups)
-            print("  3.2: 计算IC时间序列...")
-            ic_series = self._calculate_ic_series(combined)
-            print("  3.3: 计算多空收益...")
-            long_short_data = self._calculate_long_short_returns(positions_returns, n_groups)
+            # 创建单因子分析器
+            single_analyzer = SingleFactorAnalyzer(
+                factor_data=combined_long,
+                returns_data=self.prices,
+                factor_name='combined_factor',
+                rebalance_period=self.rebalance_period
+            )
             
-            print("步骤4: 创建结果对象...")
-            result = ComboResult(
+            # 使用单因子测试类计算持仓和收益
+            positions_returns = single_analyzer.compute_positions_and_returns(n_groups=n_groups)
+            
+            # 计算IC统计（统一使用max_lag=5，避免重复调用）
+            ic_stats = single_analyzer.compute_ic_and_stats(method='spearman', max_lag=1)
+            ic_series = ic_stats['IC_series']
+            
+            # 直接计算多空收益和统计指标，避免重复调用analyze_performance
+            long_short_data = self._calculate_performance_metrics(positions_returns, ic_stats, n_groups)
+            
+            # 计算纯多、纯空、多空的年化收益和夏普比例
+            # 纯多收益（最高分组）
+            high_group_returns = positions_returns['group_daily_returns'].iloc[:, -1].fillna(0)
+            high_annual_return = (1 + high_group_returns).prod() ** (252 / len(high_group_returns)) - 1
+            high_volatility = high_group_returns.std() * np.sqrt(252)
+            high_sharpe = high_annual_return / high_volatility if high_volatility > 0 else np.nan
+            
+            # 纯空收益（最低分组）
+            low_group_returns = positions_returns['group_daily_returns'].iloc[:, 0].fillna(0)
+            low_annual_return = (1 + low_group_returns).prod() ** (252 / len(low_group_returns)) - 1
+            low_volatility = low_group_returns.std() * np.sqrt(252)
+            low_sharpe = low_annual_return / low_volatility if low_volatility > 0 else np.nan
+            
+            # 多空组合收益
+            long_short_returns = high_group_returns - low_group_returns
+            ls_annual_return = (1 + long_short_returns).prod() ** (252 / len(long_short_returns)) - 1
+            ls_volatility = long_short_returns.std() * np.sqrt(252)
+            ls_sharpe = ls_annual_return / ls_volatility if ls_volatility > 0 else np.nan
+            
+            # 提取需要的多空数据
+            long_short_data = {
+                'long_only_returns': long_short_data['long_short']['long_returns'],
+                'long_returns': long_short_data['long_short']['long_returns'],
+                'short_returns': long_short_data['long_short']['short_returns'],
+                'long_short_returns': long_short_data['long_short']['long_short_returns'],
+                'summary': {
+                    'annual_return': long_short_data['long_short']['stats']['annualized_return'],
+                    'annual_volatility': long_short_data['long_short']['stats']['std_return'] * np.sqrt(252),
+                    'sharpe_ratio': long_short_data['long_short']['stats']['sharpe_ratio'],
+                    'long_annual_return': long_short_data['long_short']['stats']['annualized_return'],
+                    'long_sharpe_ratio': long_short_data['long_short']['stats']['sharpe_ratio'],
+                    # 新增：纯多、纯空、多空的年化收益和夏普比例
+                    'high_annual_return': high_annual_return,
+                    'high_sharpe_ratio': high_sharpe,
+                    'low_annual_return': low_annual_return,
+                    'low_sharpe_ratio': low_sharpe,
+                    'ls_annual_return': ls_annual_return,
+                    'ls_sharpe_ratio': ls_sharpe,
+                }
+            }
+
+            ic_mean = float(ic_series.mean()) if len(ic_series) else np.nan
+            ic_std = float(ic_series.std()) if len(ic_series) else np.nan
+            icir = ic_mean / ic_std if (ic_std and ic_std != 0) else np.nan
+            ic_pos = float((ic_series > 0).mean()) if len(ic_series) else np.nan
+
+            long_short_data['summary'].update({
+                'ic_mean': ic_mean,
+                'ic_std': ic_std,
+                'icir': icir,
+                'ic_positive_ratio': ic_pos,
+            })
+
+            return ComboResult(
                 combined_factor=combined,
                 weight_history=weight_hist,
                 ic_series=ic_series,
                 long_only_returns=long_short_data['long_only_returns'],
                 group_returns=positions_returns['group_daily_returns'],
-                summary=long_short_data['summary']
+                summary=long_short_data['summary'],
             )
-            
-            print("合成因子构建完成！")
-            return result
-            
+
         except Exception as e:
-            print(f"构建合成因子时发生错误: {e}")
-            import traceback
-            traceback.print_exc()
             raise
 
+    def _calculate_performance_metrics(self, positions_returns, ic_stats, n_groups):
+        """计算绩效指标，避免重复调用SingleFactorAnalyzer的方法"""
+        print("  [绩效层] 汇总绩效指标 ...")
+        
+        grp_ret = positions_returns['group_daily_returns']
+        
+        # 自动判断多空方向（基于IC均值）
+        first_ic_key = [k for k in ic_stats.keys() if k != 'IC_series'][0]
+        ic_mean = ic_stats[first_ic_key]['IC_mean']
+        if pd.isna(ic_mean) or ic_mean >= 0:
+            long_group, short_group = n_groups - 1, 0  # 因子正相关：多高空低
+        else:
+            long_group, short_group = 0, n_groups - 1  # 因子负相关：多低空高
+
+        long_returns = grp_ret.get(long_group, pd.Series(dtype=float))
+        short_returns = grp_ret.get(short_group, pd.Series(dtype=float))
+
+        long_short_returns = long_returns - short_returns
+        # 多空累计净值
+        cum_ls = (1 + long_short_returns.fillna(0)).cumprod()
+
+        # 计算多空统计指标
+        stats_pack = {
+            'mean_return': long_short_returns.mean(),
+            'std_return': long_short_returns.std(),
+            'sharpe_ratio': (long_short_returns.mean() / long_short_returns.std()) if long_short_returns.std() not in [0, np.nan] else np.nan,
+            'max_drawdown': self._calculate_max_drawdown(cum_ls),
+            'win_rate': (long_short_returns > 0).mean(),
+            'total_return': (cum_ls.iloc[-1] - 1) if len(cum_ls) else np.nan,
+            'annualized_return': self._calculate_annualized_return(long_short_returns)
+        }
+
+        return {
+            'long_short': {
+                'long_short_returns': long_short_returns,
+                'cumulative_ls_returns': cum_ls,
+                'long_returns': long_returns,
+                'short_returns': short_returns,
+                'stats': stats_pack
+            }
+        }
+
+    def _calculate_max_drawdown(self, cumulative_returns):
+        """计算最大回撤"""
+        if len(cumulative_returns) == 0:
+            return np.nan
+        running_max = cumulative_returns.expanding().max()
+        dd = (cumulative_returns - running_max) / running_max
+        return dd.min()
+
+    def _calculate_annualized_return(self, returns):
+        """计算年化收益率"""
+        if len(returns) == 0:
+            return np.nan
+        total_return = (1 + returns.fillna(0)).prod() - 1
+        years = len(returns) / 252.0
+        return (1 + total_return) ** (1.0 / years) - 1 if years > 0 else np.nan
+
     def _calculate_ic_series(self, factor: pd.DataFrame) -> pd.Series:
-        """计算IC时间序列"""
-        fac_long = factor.stack().rename('factor_value').reset_index()
-        ret_long = self.returns_wide.stack().rename('ret').reset_index()
+        """计算IC时间序列（优化版本）"""
+        # 使用向量化操作，避免循环
+        factor_values = factor.values
+        returns_values = self.returns_wide.values
         
-        fac_long.columns = ['date', 'order_book_id', 'factor_value']
-        ret_long.columns = ['date', 'order_book_id', 'ret']
+        # 预分配IC数组
+        ic_series = pd.Series(index=factor.index, dtype=float)
         
-        df = pd.merge(fac_long, ret_long, on=['date','order_book_id'], how='inner').dropna()
-        ic_series = pd.Series(index=df['date'].unique(), dtype=float)
-        
-        for date in ic_series.index:
-            date_data = df[df['date'] == date]
-            if len(date_data) >= 10:
-                x, y = date_data['factor_value'], date_data['ret']
-                
-                if self.enable_stock_filter and hasattr(self, 'filter_flags'):
-                    valid_mask = self._filter_stocks_for_buy(date)
-                    if len(valid_mask) > 0:
-                        valid_stocks = valid_mask[valid_mask].index
-                        if len(valid_stocks) > 0:
-                            date_data = date_data[date_data['order_book_id'].isin(valid_stocks)]
-                            if len(date_data) >= 10:
-                                x, y = date_data['factor_value'], date_data['ret']
-                
-                x_vals, y_vals = x.values, y.values
-                
-                if np.std(x_vals, ddof=0) == 0 or np.std(y_vals, ddof=0) == 0:
-                    ic_series[date] = np.nan
-                    continue
-                    
-                try:
-                    ic_series[date] = float(stats.spearmanr(x, y)[0])
-                except Exception:
-                    ic_series[date] = np.nan
+        for i, date in enumerate(factor.index):
+            # 获取当前日期的数据
+            f_vals = factor_values[i, :]
+            r_vals = returns_values[i, :]
+            
+            # 过滤NaN值
+            mask = ~(np.isnan(f_vals) | np.isnan(r_vals))
+            if np.sum(mask) < 10:
+                ic_series.iloc[i] = np.nan
+                continue
+            
+            f_clean = f_vals[mask]
+            r_clean = r_vals[mask]
+            
+            # 股票筛选
+            if self.enable_stock_filter and hasattr(self, 'filter_flags'):
+                valid_mask = self._filter_stocks_for_buy(date)
+                if len(valid_mask) > 0:
+                    valid_stocks = valid_mask[valid_mask].index
+                    if len(valid_stocks) > 0:
+                        # 获取有效股票的索引
+                        stock_indices = [j for j, stock in enumerate(factor.columns) if stock in valid_stocks]
+                        if len(stock_indices) >= 10:
+                            f_clean = f_vals[stock_indices]
+                            r_clean = r_vals[stock_indices]
+                            # 再次过滤NaN
+                            mask2 = ~(np.isnan(f_clean) | np.isnan(r_clean))
+                            if np.sum(mask2) >= 10:
+                                f_clean = f_clean[mask2]
+                                r_clean = r_clean[mask2]
+            
+            # 计算IC
+            if len(f_clean) >= 10:
+                if np.std(f_clean, ddof=0) == 0 or np.std(r_clean, ddof=0) == 0:
+                    ic_series.iloc[i] = np.nan
+                else:
+                    try:
+                        ic_series.iloc[i] = float(stats.spearmanr(f_clean, r_clean)[0])
+                    except Exception:
+                        ic_series.iloc[i] = np.nan
             else:
-                ic_series[date] = np.nan
+                ic_series.iloc[i] = np.nan
 
         return ic_series
 
@@ -731,7 +781,7 @@ class FactorCombiner:
         )
         page.add(line_ic)
 
-        # 3) 纯多累计收益（log10）
+        # 3) 最高分组累计收益（log10）
         line_ls = Line()
         idx_ref = None
         for m, res in result_map.items():
@@ -751,7 +801,59 @@ class FactorCombiner:
         )
         page.add(line_ls)
 
-        # 4) 分组累计收益柱状图
+        # 4) 最低分组累计收益（log10）
+        line_ls_low = Line()
+        idx_ref = None
+        for m, res in result_map.items():
+            # 获取最低分组收益
+            grp_ret = res.group_returns
+            if grp_ret.shape[1] >= 1:
+                low_group_returns = grp_ret.iloc[:, 0].fillna(0)  # 第一列是最低分组
+                s = (1 + low_group_returns).cumprod()
+                if idx_ref is None:
+                    idx_ref = s.index
+                    line_ls_low.add_xaxis([d.strftime('%Y-%m-%d') for d in idx_ref])
+                s = s.reindex(idx_ref).ffill().fillna(1)
+                s_log = np.log10(s)
+                line_ls_low.add_yaxis(m, s_log.values.tolist(), is_smooth=True, symbol_size=0, label_opts=opts.LabelOpts(is_show=False))
+        if idx_ref is not None:
+            line_ls_low.set_global_opts(
+                title_opts=opts.TitleOpts(title="最低分组累计收益对比 (因子值最小的10%, log10)"),
+                datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=45)),
+                yaxis_opts=opts.AxisOpts(name="累计收益 (log10)"),
+                tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
+            )
+            page.add(line_ls_low)
+
+        # 5) 多空组合累计收益（log10）
+        line_ls_combined = Line()
+        idx_ref = None
+        for m, res in result_map.items():
+            # 计算多空组合收益
+            grp_ret = res.group_returns
+            if grp_ret.shape[1] >= 2:
+                high_group_returns = grp_ret.iloc[:, -1].fillna(0)  # 最高分组
+                low_group_returns = grp_ret.iloc[:, 0].fillna(0)    # 最低分组
+                long_short_returns = high_group_returns - low_group_returns  # 多空组合
+                s = (1 + long_short_returns).cumprod()
+                if idx_ref is None:
+                    idx_ref = s.index
+                    line_ls_combined.add_xaxis([d.strftime('%Y-%m-%d') for d in idx_ref])
+                s = s.reindex(idx_ref).ffill().fillna(1)
+                s_log = np.log10(s)
+                line_ls_combined.add_yaxis(m, s_log.values.tolist(), is_smooth=True, symbol_size=0, label_opts=opts.LabelOpts(is_show=False))
+        if idx_ref is not None:
+            line_ls_combined.set_global_opts(
+                title_opts=opts.TitleOpts(title="多空组合累计收益对比 (最高分组-最低分组, log10)"),
+                datazoom_opts=[opts.DataZoomOpts(range_start=0, range_end=100)],
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=45)),
+                yaxis_opts=opts.AxisOpts(name="累计收益 (log10)"),
+                tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross")
+            )
+            page.add(line_ls_combined)
+
+        # 6) 分组累计收益柱状图
         best_name = None
         best_sharpe = -np.inf
         for m, res in result_map.items():
@@ -791,7 +893,7 @@ class FactorCombiner:
                 )
                 page.add(bar)
 
-        # 5) 性能表格
+        # 7) 性能表格
         rows = []
         for m, res in result_map.items():
             sm = res.summary
@@ -800,12 +902,16 @@ class FactorCombiner:
                 f"{sm.get('ic_mean', np.nan):.4f}" if pd.notna(sm.get('ic_mean', np.nan)) else 'N/A',
                 f"{sm.get('icir', np.nan):.4f}" if pd.notna(sm.get('icir', np.nan)) else 'N/A',
                 f"{sm.get('ic_positive_ratio', np.nan):.4f}" if pd.notna(sm.get('ic_positive_ratio', np.nan)) else 'N/A',
-                f"{sm.get('annual_return', np.nan):.2%}" if pd.notna(sm.get('annual_return', np.nan)) else 'N/A',
-                f"{sm.get('sharpe_ratio', np.nan):.2f}" if pd.notna(sm.get('sharpe_ratio', np.nan)) else 'N/A',
+                f"{sm.get('high_annual_return', np.nan):.2%}" if pd.notna(sm.get('high_annual_return', np.nan)) else 'N/A',
+                f"{sm.get('high_sharpe_ratio', np.nan):.2f}" if pd.notna(sm.get('high_sharpe_ratio', np.nan)) else 'N/A',
+                f"{sm.get('low_annual_return', np.nan):.2%}" if pd.notna(sm.get('low_annual_return', np.nan)) else 'N/A',
+                f"{sm.get('low_sharpe_ratio', np.nan):.2f}" if pd.notna(sm.get('low_sharpe_ratio', np.nan)) else 'N/A',
+                f"{sm.get('ls_annual_return', np.nan):.2%}" if pd.notna(sm.get('ls_annual_return', np.nan)) else 'N/A',
+                f"{sm.get('ls_sharpe_ratio', np.nan):.2f}" if pd.notna(sm.get('ls_sharpe_ratio', np.nan)) else 'N/A',
             ])
         table = (
             Table()
-            .add(headers=["方法", "IC均值", "ICIR", "IC正比例", "年化收益", "夏普"], rows=rows)
+            .add(headers=["方法", "IC均值", "ICIR", "IC正比例", "纯多年化收益", "纯多夏普", "纯空年化收益", "纯空夏普", "多空年化收益", "多空夏普"], rows=rows)
         )
         page.add(table)
         

@@ -49,7 +49,8 @@ def load_data():
 
     return data
 
-def run_factor_combination_analysis(factor_names=None, N_values=None, methods=None, rebalance_period=1, save_combined_factors=True):
+def run_factor_combination_analysis(factor_names=None, N_values=None, methods=None, rebalance_period=1, save_combined_factors=True,
+                                   n_groups=10, lag_days=5, normalize_lag=True):
     """运行因子复合分析"""
     print("=" * 60)
     print("因子复合分析")
@@ -120,8 +121,14 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
                     rebalance_period=rebalance_period
                 )
                 
-                # 运行分析
-                result = combiner.build(method=method, N=N)
+                # 运行分析 - 添加新的参数支持
+                result = combiner.build(
+                    method=method, 
+                    N=N, 
+                    n_groups=n_groups,  # 分组数
+                    lag_days=lag_days,   # 滞后天数
+                    normalize_lag=normalize_lag  # 是否归一化滞后
+                )
                 results[f"{method}_N{N}"] = result
                 
                 # 保存复合因子数据
@@ -136,7 +143,7 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
                         'summary': result.summary
                     }
                 
-                print(f"        ✓ 完成 - IC均值: {result.summary['ic_mean']:.4f}, 夏普: {result.summary['sharpe_ratio']:.2f}")
+                print(f"        ✓ 完成 - IC均值: {result.summary['ic_mean']:.4f}, 纯多夏普: {result.summary['high_sharpe_ratio']:.2f}, 纯多年化收益: {result.summary['high_annual_return']:.2%}")
                 
             except Exception as e:
                 print(f"        ✗ 失败: {e}")
@@ -178,7 +185,8 @@ def run_factor_combination_analysis(factor_names=None, N_values=None, methods=No
     
     return results, combined_factors_data
 
-def main(factor_names=None, N_values=None, methods=None, rebalance_period=1, save_combined_factors=True):
+def main(factor_names=None, N_values=None, methods=None, rebalance_period=1, save_combined_factors=True, 
+         n_groups=10, lag_days=5, normalize_lag=True):
     """主函数 - 运行因子复合分析"""
     try:
         print("开始执行因子复合分析...")
@@ -187,7 +195,10 @@ def main(factor_names=None, N_values=None, methods=None, rebalance_period=1, sav
             N_values=N_values,
             methods=methods,
             rebalance_period=rebalance_period,
-            save_combined_factors=save_combined_factors
+            save_combined_factors=save_combined_factors,
+            n_groups=n_groups,
+            lag_days=lag_days,
+            normalize_lag=normalize_lag
         )
         print("因子复合分析执行完成！")
         return result
@@ -199,25 +210,19 @@ def main(factor_names=None, N_values=None, methods=None, rebalance_period=1, sav
         return None
 
 if __name__ == "__main__":
-    # 示例：运行因子复合分析，设置调仓周期为5天
-    # 方式1：指定特定因子（取消注释并修改因子名）
-    # main(
-    #     factor_names=['factor_1', 'factor_2'],  # 修改为实际存在的因子名
-    #     N_values=[20, 60, 120], 
-    #     methods=['univariate', 'multivariate', 'rank_ic'],
-    #     rebalance_period=5,  # 每5个交易日调仓一次
-    #     save_combined_factors=True  # 保存复合因子到pkl文件
-    # )
-    
+
 
     try:
         print("程序开始执行...")
         main(
-            factor_names=['beta', 'size', 'momentum'],  # None表示使用所有可用因子
+            factor_names=None,  # None表示使用所有可用因子
             N_values=[20, 60, 120], 
-            methods=['univariate', 'multivariate', 'rank_ic'],
-            rebalance_period=5,  # 每5个交易日调仓一次
-            save_combined_factors=True  # 保存复合因子到pkl文件
+            methods=['multivariate', 'rank_ic'],
+            rebalance_period=1,  # 每5个交易日调仓一次
+            save_combined_factors=True,  # 保存复合因子到pkl文件
+            n_groups=10,         # 分组数
+            lag_days=1,          # 滞后天数
+            normalize_lag=True    # 是否归一化滞后
         )
         print("程序执行完成！")
     except KeyboardInterrupt:
